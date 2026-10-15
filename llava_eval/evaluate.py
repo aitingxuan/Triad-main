@@ -201,11 +201,13 @@ if __name__ == "__main__":
         "--scheme_requery",
         type=str,
         default=None,
-        choices=["hyp", "hyp_v2"],
+        choices=["hyp", "hyp_v2", "selfq"],
         help=(
-            "Hypothesis requery (v0 only). Fixed-template H_A/H_B sub-questions "
-            "on the full image; NEVER musc_scores. "
-            "hyp: hard +1 aggregate. hyp_v2: soft votes + pair antisymmetry + p_f mix. "
+            "Hypothesis requery (v0 only). NEVER musc_scores. "
+            "hyp: fixed-template H_A/H_B, hard +1 aggregate. "
+            "hyp_v2: fixed-template, soft votes + pair antisymmetry + p_f mix. "
+            "selfq: model WRITES its own yes/no check (T2), answered by forced two-choice "
+            "readout, entropy-gated + Bayesian logit fusion (no tau_ev/band/delta). "
             "Selection: --requery_gate band (default) or quantile (Defv3). "
             "Fallback to llm_letter. Mutually exclusive with --ab_tau."
         ),
@@ -291,6 +293,25 @@ if __name__ == "__main__":
         help="hyp_v2: tanh(score/temp) temperature. Default 1.0.",
     )
     parser.add_argument(
+        "--requery_max_turns",
+        type=int,
+        default=2,
+        help="selfq: max self-generated questions per selected sample. Default 2.",
+    )
+    parser.add_argument(
+        "--requery_selfq_clip",
+        type=float,
+        default=6.0,
+        help="selfq: saturation cap on each evidence logit (numeric guard, not a decision "
+        "constant; ~p=0.9975). Default 6.0.",
+    )
+    parser.add_argument(
+        "--requery_selfq_gen_max_new_tokens",
+        type=int,
+        default=64,
+        help="selfq: max new tokens when the model writes its own question. Default 64.",
+    )
+    parser.add_argument(
         "--ecpr_sidecar",
         type=str,
         default=None,
@@ -358,6 +379,9 @@ if __name__ == "__main__":
             "checklist": str(args.requery_checklist),
             "gate": gate,
             "top_frac": float(args.requery_top_frac),
+            "max_turns": int(args.requery_max_turns),
+            "selfq_clip": float(args.requery_selfq_clip),
+            "selfq_gen_max_new_tokens": int(args.requery_selfq_gen_max_new_tokens),
         }
         if mode == "hyp_v2":
             requery.update({

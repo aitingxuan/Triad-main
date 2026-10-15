@@ -1,7 +1,7 @@
 # 不确定样本：图像证据 / 子问题追问方案（替代 Scheme B）
 
 > 动机：Scheme B（窄带内回看 `musc_scores`）是测试侧分数拼接，不是「决策吃视觉证据」的机制解。  
-> 本文档保存替代方案；**当前落地为方案 3（固定模板双向追问）**。方案 2（ROI crop 再问）已移除。  
+> 本文档保存替代方案；**当前落地为方案 3（固定模板双向追问）与方案 4（`selfq`：T2 自生成问题 + 贝叶斯融合）**。方案 2（ROI crop 再问）已移除。  
 > 相关：`docs/V0_SOFTMAX_CONFIDENCE_PROBE.md`、`docs/DECISION_DIAG_HANDOFF.md`。  
 > 参考论文：Srinivasan et al., *Selective “Selective Prediction”: Reducing Unnecessary Abstention in Vision-Language Reasoning* (ACL Findings 2024) — ReCoVERR。
 
@@ -146,6 +146,63 @@ Sidecar 额外：`u`、`u_thr`、`gate=quantile`。
 
 ---
 
+## 方案 4：自生成问题 + 贝叶斯证据融合（`selfq`，T2，已实现）
+
+> 恢复初衷：让模型**自己写核验问题**（T2：propose→answer），而不是查手写模板；并用**无绝对阈值**的方式决定是否采信。
+
+### 4.1 动机（修正方案 3 的两个痛点）
+
+- 痛点 A：困难例选取依赖**窄带** `[lo,hi]`，或即使 quantile 也要 `tau_ev=0.7` 这类绝对阈值——脆弱、难迁移。
+- 痛点 B：子问题来自 `hyp_checklists.py` 的**固定模板**，与图像无关、且按类别泄露缺陷 taxonomy，不通用。
+
+### 4.2 设计（零 band / 零 tau_ev / 零 delta）
+
+1. **选取**：沿用 quantile gate（两遍评测），默认 `top_frac=0.1`（最不确定的 10%）。**去掉 band**。
+2. **出题（T2，自由文本）**：模型针对同一张图**自己生成**一条 yes/no 核验问题，并声明映射：
+   ```text
+   QUESTION: <一句可在图上核验的 yes/no 问题>
+   YES_SUPPORTS: <A or B>
+   NO_SUPPORTS:  <A or B>
+   ```
+3. **作答（强制二分）**：把 `QUESTION` 用 `A. Yes / B. No` 拼进去跑单 token 打分 → `p_Yes`。
+   **无论问题多开放，答案永远是二分类且带概率**（关键：生成自由、作答闭合）。
+4. **稳定判据=相对锐度（替代 `tau_ev`）**：仅当 `H(sub) < H(main)`（子问题二分类熵 < 主问题熵）才采信。
+5. **融合同样无阈值**：`logit_final = logit(p_main_A) + Σ w_i·sub_logit_A`，`w_i∈{0,1}`，以 **0** 决断；
+   单条证据 logit 仅做 `±6` 饱和保护（数值守卫，非决策常数，≈ p=0.9975）。
+6. **永不** `musc_scores`；解析失败/无信息（Yes/No 指向同侧或 `neither`）→ 丢弃该条；无任何采信证据 → 回退主答案。
+
+### 4.3 代码入口
+
+| 位置 | 作用 |
+|---|---|
+| `eval_0shot_path.sh` / `scripts/...prod.sh` | mode `scheme_requery_selfq[:top_frac[:max_turns]]`（tag `requerySelfq`） |
+| `llava_eval/evaluate.py` | `--scheme_requery selfq`（`choices` 已含）；`--requery_max_turns`、`--requery_selfq_clip`、`--requery_selfq_gen_max_new_tokens` |
+| `llava_eval/simple_model_worker.py` | `mode="selfq"` 分支：生成→强制二分→熵门→`bayes_fuse` |
+| `llava_eval/hyp_selfq.py` | 自生成 prompt、结构化解析、`binary_entropy`、`sub_evidence_logit_for_a`、`bayes_fuse` |
+
+Sidecar：`selfq`（`logit_main/evidence_logit/logit_final/p_final/n_evidence`）、`sub_answers[*]`（`gen_text/q/yes_supports/no_supports/p_A/p_B/accept/kept/reason`）。
+`decision_src`：`selfq_bayes` | `hyp_fallback`（另有 gate 侧 `llm_argmax_out_of_band` / `llm_argmax_score_only`）。
+
+### 4.4 推荐调用
+
+```text
+--scheme_requery selfq --requery_gate quantile --requery_top_frac 0.1 --requery_max_turns 2
+
+# shell:
+scheme_requery_selfq            # 默认 top_frac=0.1, max_turns=2
+scheme_requery_selfq:0.1:2
+```
+
+### 4.5 消融建议
+
+- `top_frac`∈{0.05,0.1,0.2}；`max_turns`∈{1,2,3}；
+- 熵门开/关（关=只看是否 informative）；
+- 融合 vs 挑战者（默认保留主答案、稳定一致指向反面才翻案）；
+- 重点指标：选中集 Acc/TNR、**翻案率**、`decision_src` 分布、额外 forward 数、解析失败率；
+- 盯"翻对 vs 误伤"（把原本对的改成错的量）。
+
+---
+
 ## 组合与落地优先级
 
 | 优先级 | 组合 | 状态 |
@@ -154,7 +211,8 @@ Sidecar 额外：`u`、`u_thr`、`gate=quantile`。
 | **P1** | **方案 3 固定模板双向** | **已落地** |
 | **P1b** | **方案 3b 软聚合 hyp_v2** | **已落地** |
 | **P1c** | **方案 3c Defv3（quantile + contrastive）** | **已落地** |
-| P2 | 方案 1 完整 ReCoVERR（开放出题） | 未做 |
+| **P1d** | **方案 4 selfq（T2 自生成 + 贝叶斯融合，无绝对阈值）** | **已落地** |
+| P2 | 方案 1 完整 ReCoVERR（开放出题，多轮反驳） | 未做 |
 | 兜底 | 证据仍不足 → **回退全图 llm_letter** | **禁止** `musc_scores` |
 
 **建议指标（除 Acc/Pre/Rec/TNR）：**

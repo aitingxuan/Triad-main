@@ -17,6 +17,7 @@ prod=$7
 #         scheme_requery_default_v3 | scheme_requery_default_v3:<top_frac>:<tau_ev>:<delta>
 #         scheme_requery_v2 | scheme_requery_v2:<lo>:<hi>:<tau_ev>:<delta>
 #         scheme_requery_v2_default | scheme_requery_v2_default:<lo>:<hi>:<tau_ev>:<delta>
+#         scheme_requery_selfq | scheme_requery_selfq:<top_frac>:<max_turns>
 #       examples:  scheme_requery
 #                  scheme_requery:0.4:0.7:0.7:1
 #                  scheme_requery_default   # DEFAULT checklist, max_subq=2 (tag requeryHypDef)
@@ -24,6 +25,8 @@ prod=$7
 #                  scheme_requery_default_v3  # Defv3: quantile gate + contrastive checklist (tag requeryHypDefv3)
 #                  scheme_requery_default_v3:0.1:0.7:1
 #                  scheme_requery_v2        # A2 soft aggregate (tag requeryHypv2)
+#                  scheme_requery_selfq     # T2 self-questioning + Bayesian fusion (tag requerySelfq)
+#                  scheme_requery_selfq:0.1:2
 #                  ab_tau=0.7
 # NOTE: scheme_b (musc_scores) and ROI crop requery have been removed.
 temperature=${8:-0}
@@ -70,6 +73,27 @@ _parse_scheme_requery() {
 
 if [[ -z "$mode" ]]; then
     :
+elif [[ "$mode" == scheme_requery_selfq || "$mode" == scheme_requery_selfq:* ]]; then
+    # Scheme 4 (T2): model self-WRITES a yes/no check, answered by forced two-choice
+    # readout; evidence is entropy-gated (sharper than main) and Bayesian-fused.
+    # Recommended hard-example gate = quantile top ~10%. NO tau_ev / band / delta.
+    # Optional: scheme_requery_selfq:<top_frac>:<max_turns>
+    decode_tag="${decode_tag}_requerySelfq"
+    extra_args+=(
+        --scheme_requery selfq
+        --requery_gate quantile
+    )
+    if [[ "$mode" == *:* ]]; then
+        IFS=':' read -r _ top_frac max_turns <<< "$mode"
+        if [[ -n "${top_frac:-}" ]]; then
+            decode_tag="${decode_tag}_tf${top_frac}"
+            extra_args+=(--requery_top_frac "$top_frac")
+        fi
+        if [[ -n "${max_turns:-}" ]]; then
+            decode_tag="${decode_tag}_nt${max_turns}"
+            extra_args+=(--requery_max_turns "$max_turns")
+        fi
+    fi
 elif [[ "$mode" == scheme_requery_v2_default || "$mode" == scheme_requery_v2_default:* ]]; then
     _parse_scheme_requery "$mode" "requeryHypv2Def" "default" "hyp_v2"
 elif [[ "$mode" == scheme_requery_v2 || "$mode" == scheme_requery_v2:* ]]; then
@@ -115,7 +139,7 @@ elif [[ "$mode" == scheme_b* ]]; then
     echo "ERROR: scheme_b (musc_scores hard gate) has been removed. Use scheme_requery."
     exit 1
 else
-    echo "Unknown mode='$mode'. Use empty | scheme_requery[_v2][_default|_default_v2|_default_v3] | … | ab_tau=<x>"
+    echo "Unknown mode='$mode'. Use empty | scheme_requery[_v2][_default|_default_v2|_default_v3] | scheme_requery_selfq | … | ab_tau=<x>"
     exit 1
 fi
 

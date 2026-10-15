@@ -21,7 +21,7 @@ echo $exp_name
 # NEVER musc_scores as label. Only valid for v0. Does NOT apply to cotm_* (long text).
 #
 # Inner args: model exp v gpu dataset expert prod [temperature] [mode]
-# mode: scheme_requery | scheme_requery_v2 | scheme_requery:lo:hi:tau_ev:delta | ab_tau=0.7 | (empty=free generate)
+# mode: scheme_requery | scheme_requery_v2 | scheme_requery_selfq | scheme_requery:lo:hi:tau_ev:delta | ab_tau=0.7 | (empty=free generate)
 
 bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
   "$model_path" "$exp_name" v0 "$gpu" mvtec _musc all 0 scheme_requery
@@ -46,6 +46,13 @@ bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
 #   "$model_path" "$exp_name" v0 "$gpu" mvtec _musc all 0 scheme_requery_default_v3
 # bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
 #   "$model_path" "$exp_name" v0 "$gpu" mvtec _musc all 0 scheme_requery_default_v3:0.1:0.7:1
+
+# Scheme 4 (requerySelfq): T2 model self-writes yes/no checks; entropy gate + Bayesian fusion.
+# Quantile top-~10% hardest; NO tau_ev / band / delta.
+# bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
+#   "$model_path" "$exp_name" v0 "$gpu" mvtec _musc all 0 scheme_requery_selfq
+# bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
+#   "$model_path" "$exp_name" v0 "$gpu" mvtec _musc all 0 scheme_requery_selfq:0.1:2
 
 # Scheme A (pure P(A) threshold) — v0 only:
 # bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \

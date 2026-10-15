@@ -24,6 +24,14 @@ from llava.conversation import (default_conversation, conv_templates,
 
 from hyp_checklists import format_subq, get_hyp_checklist, uncertainty_from_p_a
 from hyp_aggregate_v2 import aggregate_hyp_v2
+from hyp_selfq import (
+    build_instruction as build_selfq_instruction,
+    parse_selfq_generation,
+    entropy_accept,
+    sub_evidence_logit_for_a,
+    bayes_fuse,
+    DEFAULT_EVIDENCE_CLIP,
+)
 
 
 def _single_token_ids(tokenizer, texts):
@@ -221,9 +229,9 @@ class SimpleModelWorker:
             gate_name = "band"
             if requery is not None:
                 mode = str(requery.get("mode", "hyp")).lower()
-                if mode not in ("hyp", "hyp_v2"):
+                if mode not in ("hyp", "hyp_v2", "selfq"):
                     raise ValueError(
-                        f"Unsupported requery mode={mode!r}; expected 'hyp' or 'hyp_v2'."
+                        f"Unsupported requery mode={mode!r}; expected 'hyp', 'hyp_v2' or 'selfq'."
                     )
                 lo = float(requery.get("lo", 0.4))
                 hi = float(requery.get("hi", 0.7))
@@ -262,10 +270,6 @@ class SimpleModelWorker:
                     letter = llm_letter
                     decision_src = "hyp_fallback_no_image"
                 else:
-                    cl_key = str(requery.get("checklist", "per_class")).lower()
-                    checklist = get_hyp_checklist(subset, checklist=cl_key)
-                    ha_qs = list(checklist.get("H_A") or [])[: max(0, max_subq)]
-                    hb_qs = list(checklist.get("H_B") or [])[: max(0, max_subq)]
                     tmpl = params.get("conv_template", "qwen_1_5")
                     if tmpl not in conv_templates:
                         tmpl = "qwen_1_5"
@@ -282,62 +286,149 @@ class SimpleModelWorker:
                             pr = pr.replace(DEFAULT_IMAGE_TOKEN, rt)
                         return pr
 
-                    # Collect sub-answers (same forwards for hyp / hyp_v2).
-                    for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
-                        for q in qlist:
-                            _, _, sp_a, sp_b = _ab_forward_prompt(_build_sub_prompt(q))
-                            conf = max(sp_a, sp_b)
-                            ans_letter = "A" if sp_a >= 0.5 else "B"
-                            kept = conf >= tau_ev
-                            sub_records.append({
-                                "hyp": hyp_tag,
-                                "q": q,
-                                "p_A": sp_a,
-                                "p_B": sp_b,
-                                "letter": ans_letter,
-                                "conf": conf,
-                                "kept": kept,
-                            })
-
-                    if mode == "hyp_v2":
-                        letter, decision_src, hyp_v2_diag = aggregate_hyp_v2(
-                            sub_records,
-                            p_a,
-                            llm_letter,
-                            tau_ev=tau_ev,
-                            delta=delta,
-                            conflict_lambda=float(requery.get("conflict_lambda", 0.3)),
-                            agree_lambda=float(requery.get("agree_lambda", 1.2)),
-                            margin_ref=float(requery.get("margin_ref", 1.0)),
-                            conflict_ratio=float(requery.get("conflict_ratio", 0.35)),
-                            soft_temp=float(requery.get("soft_temp", 1.0)),
-                        )
-                        S_A = float(hyp_v2_diag.get("S_A", 0.0))
-                        S_B = float(hyp_v2_diag.get("S_B", 0.0))
-                    else:
-                        # hyp v1: hard +1 counts (H_A Yes=>A, H_A No=>B; H_B Yes=>B, H_B No=>A).
-                        for rec in sub_records:
-                            if not rec["kept"]:
+                    if mode == "selfq":
+                        # Scheme 4 (T2): the model writes its own yes/no check, answered by a
+                        # forced two-choice readout (A=Yes/B=No) so the answer is always binary.
+                        # Evidence is entropy-gated (sharper than main) and Bayesian-fused.
+                        ev_clip = float(requery.get("selfq_clip", DEFAULT_EVIDENCE_CLIP))
+                        gen_max_new = int(requery.get("selfq_gen_max_new_tokens", 64))
+                        max_turns = max(0, int(requery.get("max_turns", 2)))
+                        main_text = params.get("main_text") or params.get("text")
+                        prior_qs = []
+                        evidences = []
+                        for _t in range(max_turns):
+                            instr = build_selfq_instruction(main_text=main_text, prior_qs=prior_qs)
+                            gen_conv = conv_templates[tmpl].copy()
+                            gbody = DEFAULT_IMAGE_TOKEN + "\n" + instr
+                            gen_conv.append_message(gen_conv.roles[0], gbody)
+                            gen_conv.append_message(gen_conv.roles[1], None)
+                            gprompt = gen_conv.get_prompt()
+                            if use_im_se:
+                                rt = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+                                gprompt = gprompt.replace(DEFAULT_IMAGE_TOKEN, rt)
+                            g_ids = tokenizer_image_token(
+                                gprompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+                            ).unsqueeze(0).to(self.device)
+                            g_out = model.generate(
+                                inputs=g_ids,
+                                do_sample=False,
+                                max_new_tokens=gen_max_new,
+                                use_cache=True,
+                                **image_args,
+                            )
+                            gen_text = tokenizer.decode(g_out[0], skip_special_tokens=True)
+                            rec = {
+                                "turn": _t,
+                                "gen_text": gen_text,
+                                "q": None,
+                                "yes_supports": None,
+                                "no_supports": None,
+                                "p_A": None,
+                                "p_B": None,
+                                "accept": False,
+                                "kept": False,
+                                "reason": None,
+                            }
+                            parsed = parse_selfq_generation(gen_text)
+                            if parsed is None:
+                                rec["reason"] = "parse_fail"
+                                sub_records.append(rec)
+                                if prior_qs:
+                                    break
                                 continue
-                            if rec["hyp"] == "H_A":
-                                if rec["letter"] == "A":
-                                    S_A += 1.0
-                                else:
-                                    S_B += 1.0
+                            q = parsed["question"]
+                            rec["q"] = q
+                            rec["yes_supports"] = parsed["yes_supports"]
+                            rec["no_supports"] = parsed["no_supports"]
+                            prior_qs.append(q)
+                            _, _, sp_a, sp_b = _ab_forward_prompt(_build_sub_prompt(q))
+                            rec["p_A"] = sp_a
+                            rec["p_B"] = sp_b
+                            rec["conf"] = max(sp_a, sp_b)
+                            rec["letter"] = "A" if sp_a >= 0.5 else "B"
+                            w, z = sub_evidence_logit_for_a(
+                                sp_a, parsed["yes_supports"], parsed["no_supports"], clip=ev_clip
+                            )
+                            if w <= 0.0:
+                                rec["reason"] = "uninformative"
+                            elif entropy_accept(sp_a, p_a):
+                                rec["accept"] = True
+                                rec["kept"] = True
+                                rec["evidence_logit"] = z
+                                evidences.append((w, z))
                             else:
-                                if rec["letter"] == "A":
-                                    S_B += 1.0
-                                else:
-                                    S_A += 1.0
-                        if S_A - S_B >= delta:
-                            letter = "A"
-                            decision_src = "hyp_test"
-                        elif S_B - S_A >= delta:
-                            letter = "B"
-                            decision_src = "hyp_test"
+                                rec["reason"] = "entropy_gate_reject"
+                            sub_records.append(rec)
+
+                        fused = bayes_fuse(p_a, evidences, clip=ev_clip)
+                        letter = "A" if fused["logit_final"] >= 0.0 else "B"
+                        decision_src = "selfq_bayes" if fused["n_evidence"] > 0 else "hyp_fallback"
+                        hyp_v2_diag = {"selfq": fused, "mode": "selfq"}
+                        ev = float(fused["evidence_logit"])
+                        S_A = ev if ev > 0 else 0.0
+                        S_B = -ev if ev < 0 else 0.0
+                    else:
+                        cl_key = str(requery.get("checklist", "per_class")).lower()
+                        checklist = get_hyp_checklist(subset, checklist=cl_key)
+                        ha_qs = list(checklist.get("H_A") or [])[: max(0, max_subq)]
+                        hb_qs = list(checklist.get("H_B") or [])[: max(0, max_subq)]
+
+                        # Collect sub-answers (same forwards for hyp / hyp_v2).
+                        for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
+                            for q in qlist:
+                                _, _, sp_a, sp_b = _ab_forward_prompt(_build_sub_prompt(q))
+                                conf = max(sp_a, sp_b)
+                                ans_letter = "A" if sp_a >= 0.5 else "B"
+                                kept = conf >= tau_ev
+                                sub_records.append({
+                                    "hyp": hyp_tag,
+                                    "q": q,
+                                    "p_A": sp_a,
+                                    "p_B": sp_b,
+                                    "letter": ans_letter,
+                                    "conf": conf,
+                                    "kept": kept,
+                                })
+
+                        if mode == "hyp_v2":
+                            letter, decision_src, hyp_v2_diag = aggregate_hyp_v2(
+                                sub_records,
+                                p_a,
+                                llm_letter,
+                                tau_ev=tau_ev,
+                                delta=delta,
+                                conflict_lambda=float(requery.get("conflict_lambda", 0.3)),
+                                agree_lambda=float(requery.get("agree_lambda", 1.2)),
+                                margin_ref=float(requery.get("margin_ref", 1.0)),
+                                conflict_ratio=float(requery.get("conflict_ratio", 0.35)),
+                                soft_temp=float(requery.get("soft_temp", 1.0)),
+                            )
+                            S_A = float(hyp_v2_diag.get("S_A", 0.0))
+                            S_B = float(hyp_v2_diag.get("S_B", 0.0))
                         else:
-                            letter = llm_letter
-                            decision_src = "hyp_fallback"
+                            # hyp v1: hard +1 counts (H_A Yes=>A, H_A No=>B; H_B Yes=>B, H_B No=>A).
+                            for rec in sub_records:
+                                if not rec["kept"]:
+                                    continue
+                                if rec["hyp"] == "H_A":
+                                    if rec["letter"] == "A":
+                                        S_A += 1.0
+                                    else:
+                                        S_B += 1.0
+                                else:
+                                    if rec["letter"] == "A":
+                                        S_B += 1.0
+                                    else:
+                                        S_A += 1.0
+                            if S_A - S_B >= delta:
+                                letter = "A"
+                                decision_src = "hyp_test"
+                            elif S_B - S_A >= delta:
+                                letter = "B"
+                                decision_src = "hyp_test"
+                            else:
+                                letter = llm_letter
+                                decision_src = "hyp_fallback"
             elif ab_tau is not None and float(ab_tau) >= 0:
                 tau = float(ab_tau)
                 letter = "A" if p_a >= tau else "B"
@@ -362,6 +453,12 @@ class SimpleModelWorker:
                 "S_B": S_B if requery is not None else None,
                 "sub_answers": sub_records if requery is not None else None,
                 "hyp_v2": hyp_v2_diag if requery is not None else None,
+                "selfq": (
+                    hyp_v2_diag.get("selfq")
+                    if (requery is not None and str((requery or {}).get("mode", "")).lower() == "selfq"
+                        and isinstance(hyp_v2_diag, dict))
+                    else None
+                ),
             }
             return letter
 
@@ -475,6 +572,7 @@ class SimpleModelWrapper:
                 "requery": inputs.get("requery", None),
                 "subset": inputs.get("subset", None),
                 "conv_template": self.template_name,
+                "main_text": inputs.get("text", None),
             }).strip()
         state.messages[-1][-1]=out
         return state,out
