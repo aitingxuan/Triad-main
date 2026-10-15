@@ -1,0 +1,79 @@
+{
+  "description": "PGRB interest closed set + interest→step attribution (not current-step gate).",
+  "interests": ["juice", "top_label", "bottom_label", "bottle_body"],
+  "interest_id": {
+    "background": 0,
+    "juice": 1,
+    "top_label": 2,
+    "bottom_label": 3,
+    "bottle_body": 4
+  },
+  "products": {
+    "banana_juice": {
+      "interest_to_step": {
+        "juice": 5,
+        "top_label": 6,
+        "bottom_label": 6,
+        "bottle_body": 4
+      },
+      "step_to_interests": {
+        "4": ["bottle_body"],
+        "5": ["juice"],
+        "6": ["top_label", "bottom_label"]
+      }
+    },
+    "cherry_juice": {
+      "interest_to_step": {
+        "juice": 4,
+        "top_label": 3,
+        "bottom_label": 3,
+        "bottle_body": 4
+      },
+      "step_to_interests": {
+        "3": ["top_label", "bottom_label"],
+        "4": ["juice", "bottle_body"]
+      }
+    },
+    "orange_juice": {
+      "interest_to_step": {
+        "juice": 4,
+        "top_label": 3,
+        "bottom_label": 3,
+        "bottle_body": 4
+      },
+      "step_to_interests": {
+        "3": ["top_label", "bottom_label"],
+        "4": ["juice", "bottle_body"]
+      }
+    }
+  },
+  "pair_rules": [
+    ["top_label", "bottom_label"],
+    ["juice", "top_label"],
+    ["juice", "bottom_label"]
+  ],
+  "mask_root": "Seg_juice/juice_interest_masks_cotm",
+  "defect_to_interests": {
+    "good": [],
+    "foreign_object_in_juice": ["juice"],
+    "too_little_juice": ["juice"],
+    "too_much_juice": ["juice"],
+    "missing_juice": ["juice"],
+    "discolor_juice": ["juice"],
+    "invalid_juice_type": ["juice"],
+    "missing_top_label": ["top_label"],
+    "missing_bottom_label": ["bottom_label"],
+    "missing_two_label": ["top_label", "bottom_label"],
+    "broken_top_label": ["top_label"],
+    "broken_bottom_label": ["bottom_label"],
+    "broken_two_label": ["top_label", "bottom_label"],
+    "top_label_missing_logo": ["top_label"],
+    "top_label_skewed_logo": ["top_label"],
+    "wrong_label": ["top_label", "bottom_label"],
+    "discolored_label": ["top_label", "bottom_label"],
+    "invalid_label_position": ["top_label", "bottom_label"],
+    "top_bottom_label_position_transform": ["top_label", "bottom_label"],
+    "foreign_object_on_label": ["top_label", "bottom_label"]
+  },
+  "source_notes": "Step numbers follow movable/process_step_map.json product tables. ECPR uses defect_to_interests for conditional part-ROI; coarse interest_to_step is attribution fallback only."
+}

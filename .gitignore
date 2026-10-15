@@ -1,0 +1,94 @@
+# ===== 权重 / 模型文件 =====
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.gguf
+*.h5
+*.onnx
+*.pkl
+*.pickle
+*.npz
+*.msgpack
+*.ot
+*.tflite
+
+# 本地合并 / 预训练模型目录（体积很大）
+/checkpoints/
+/llava-siglip-so400m-onevision-qwen2-7b/
+/llava-siglip-so400m-onevision-qwen2-7b--Triad_llava_ov/
+/llava-siglip-so400m-onevision-qwen2-7b_9ROI/
+/google/
+
+# ===== 数据集与大数据目录 =====
+/data/
+/dataset/
+/datasets/
+/Data_1shot/
+/evaluation/
+/Prometheus/
+/movable/CoTM/
+/movable/InstructIAD/
+/movable/MMData/
+/movable/images/
+/movable/images_cf/
+/movable/images_process_pseudo/
+/movable/juice_ecpr_overlay/
+/Seg_juice/checkpoints/
+/Seg_juice/juice_interest_masks/
+/Seg_juice/juice_interest_masks_cotm/
+/Seg_juice/LogSAD-master/
+
+# ===== 实验输出 / 日志 =====
+/outputs/
+/runs/
+/logs/
+/tmp_log/
+/LLM_judge_output/
+*.log
+
+# ===== 常见数据与压缩包格式 =====
+*.csv
+*.parquet
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# ===== Python / 缓存 / 系统杂项 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+__MACOSX/
+Thumbs.db
+
+# ===== IDE / 本地工具 =====
+.cursor/
+.cursor-server/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== 环境与密钥（切勿上传） =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials.json

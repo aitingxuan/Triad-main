@@ -1,0 +1,8 @@
+# CoTM_v6 (= CoTM.json three-way mix + process-align on real juice NG).
+# No process-pseudo pasted images. No TNR No×3 / normal upsample.
+# Rebuild: python3 scripts/build_cotm_v6.py --force
+datasets:
+  - json_path: /home/yz/code/Triad-main/movable/CoTM/CoTM_v6.json
+    sampling_strategy: all
+  - json_path: /home/yz/code/Triad-main/movable/InstructIAD/InstructIAD.json
+    sampling_strategy: all

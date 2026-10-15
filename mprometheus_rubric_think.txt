@@ -1,0 +1,26 @@
+###Score Rubrics: [CoT <think> — Strict text-only QA reasoning]
+# Text-only. Ignore image truth and Yes/No label correctness.
+# Score with ONE decimal in [1.0, 5.0] (e.g., 2.5, 3.7, 4.2). Do NOT default to 4 or 5.
+#
+# Anchor rule: start at 3.0 for a readable inspect→observe→conclude draft, then adjust.
+# Deduct aggressively for missing process anchors, vague observations, hedges-as-certainty,
+# contradictions, or template padding. Reserve 4.5–5.0 for rare near-reference quality.
+#
+# Hard caps (apply the lowest matching cap after adjustments):
+# - No link to any production-process step/constraint in the instruction → score ≤ 2.5
+# - Observations are generic only ("anomaly"/"defect"/"unusual" with no concrete visual detail) → score ≤ 3.0
+# - Internal contradiction OR both-sides hedge presented as a firm conclusion → score ≤ 2.5
+# - Fluent but shallow / template-like with weak causal link → typical band 3.0–3.5
+# - Clear process anchor + concrete observation + consistent conclusion, minor gaps → 3.6–4.2
+# - Near-reference: explicit process tie, specific evidence, tight causal chain, no fluff → 4.3–5.0
+#
+# Checklist (mention each briefly in feedback): process_anchor, observation_specificity,
+# causal_chain, internal_consistency, non_template_density.
+
+Score 1.0–1.9: Incoherent, empty, irrelevant, or self-contradictory with no usable QA structure.
+Score 2.0–2.9: Weak logic or chaotic structure; little/no process anchoring; unsupported leaps; inconsistent premises vs conclusion.
+Score 3.0–3.5: Readable but shallow or partly structured; some process mention or visual detail, but gaps, filler, or loose alignment of observation→conclusion. THIS IS THE DEFAULT BAND for ordinary LLM CoT.
+Score 3.6–4.2: Solid process-aware reasoning with concrete observations and mostly tight consistency; only minor missing depth or slight wording issues. Do NOT give this band for generic fluent text.
+Score 4.3–5.0: Rare exemplary CoT: explicit process-linked structure, specific evidence, rigorous causal chain, full internal consistency, minimal padding. Score 5.0 only if essentially matching the reference answer quality.
+
+

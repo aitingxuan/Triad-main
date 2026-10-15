@@ -1,0 +1,170 @@
+{
+  "banana_juice": {
+    "steps": {
+      "filling": 5,
+      "labeling": 6
+    },
+    "defects": {
+      "missing_top_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "part": "top_label",
+        "edit": "cover_with_neighbor",
+        "type_text": "Missing Top Label",
+        "location": "center"
+      },
+      "missing_bottom_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "part": "bottom_label",
+        "edit": "cover_with_neighbor",
+        "type_text": "Missing Bottom Label",
+        "location": "bottom"
+      },
+      "broken_top_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "part": "top_label",
+        "edit": "scar_inside",
+        "type_text": "Broken Top Label",
+        "location": "center"
+      },
+      "too_little_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "part": "juice",
+        "edit": "lower_fill",
+        "type_text": "Too Little Juice",
+        "location": "center"
+      },
+      "too_much_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "part": "juice",
+        "edit": "raise_fill",
+        "type_text": "Too Much Juice",
+        "location": "center"
+      },
+      "foreign_object_in_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "part": "juice",
+        "edit": "foreign_blob",
+        "type_text": "Foreign Object In Juice",
+        "location": "center"
+      }
+    }
+  },
+  "cherry_juice": {
+    "steps": {
+      "labeling": 3,
+      "filling": 4
+    },
+    "defects": {
+      "missing_top_label": {
+        "step": 3,
+        "step_name": "Label Design and Application",
+        "part": "top_label",
+        "edit": "cover_with_neighbor",
+        "type_text": "Missing Top Label",
+        "location": "center"
+      },
+      "missing_bottom_label": {
+        "step": 3,
+        "step_name": "Label Design and Application",
+        "part": "bottom_label",
+        "edit": "cover_with_neighbor",
+        "type_text": "Missing Bottom Label",
+        "location": "bottom"
+      },
+      "broken_top_label": {
+        "step": 3,
+        "step_name": "Label Design and Application",
+        "part": "top_label",
+        "edit": "scar_inside",
+        "type_text": "Broken Top Label",
+        "location": "center"
+      },
+      "too_little_juice": {
+        "step": 4,
+        "step_name": "Filling",
+        "part": "juice",
+        "edit": "lower_fill",
+        "type_text": "Too Little Juice",
+        "location": "center"
+      },
+      "too_much_juice": {
+        "step": 4,
+        "step_name": "Filling",
+        "part": "juice",
+        "edit": "raise_fill",
+        "type_text": "Too Much Juice",
+        "location": "center"
+      },
+      "foreign_object_in_juice": {
+        "step": 4,
+        "step_name": "Filling",
+        "part": "juice",
+        "edit": "foreign_blob",
+        "type_text": "Foreign Object In Juice",
+        "location": "center"
+      }
+    }
+  },
+  "orange_juice": {
+    "steps": {
+      "labeling": 3,
+      "assembly": 4
+    },
+    "defects": {
+      "missing_top_label": {
+        "step": 3,
+        "step_name": "Label Design and Application",
+        "part": "top_label",
+        "edit": "cover_with_neighbor",
+        "type_text": "Missing Top Label",
+        "location": "center"
+      },
+      "missing_bottom_label": {
+        "step": 3,
+        "step_name": "Label Design and Application",
+        "part": "bottom_label",
+        "edit": "cover_with_neighbor",
+        "type_text": "Missing Bottom Label",
+        "location": "bottom"
+      },
+      "broken_top_label": {
+        "step": 3,
+        "step_name": "Label Design and Application",
+        "part": "top_label",
+        "edit": "scar_inside",
+        "type_text": "Broken Top Label",
+        "location": "center"
+      },
+      "too_little_juice": {
+        "step": 4,
+        "step_name": "Assembly / Filling",
+        "part": "juice",
+        "edit": "lower_fill",
+        "type_text": "Too Little Juice",
+        "location": "center"
+      },
+      "too_much_juice": {
+        "step": 4,
+        "step_name": "Assembly / Filling",
+        "part": "juice",
+        "edit": "raise_fill",
+        "type_text": "Too Much Juice",
+        "location": "center"
+      },
+      "foreign_object_in_juice": {
+        "step": 4,
+        "step_name": "Assembly / Filling",
+        "part": "juice",
+        "edit": "foreign_blob",
+        "type_text": "Foreign Object In Juice",
+        "location": "center"
+      }
+    }
+  }
+}

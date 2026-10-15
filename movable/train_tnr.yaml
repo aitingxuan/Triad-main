@@ -1,0 +1,15 @@
+# TNR / anti-Yes-bias mix on the original CoTM.json (not CoTM_v3).
+# Base CoTM + InstructIAD, plus extra copies of No / normal answers.
+# Does not include musc_v0 eval FPs (would leak MVTec test).
+# Rebuild subsets: python3 scripts/build_tnr_train_data.py
+datasets:
+  - json_path: /home/yz/code/Triad-main/movable/CoTM/CoTM.json
+    sampling_strategy: all
+  # Extra 2x CoTM No answers → those samples appear ~3x overall
+  - json_path: /home/yz/code/Triad-main/movable/CoTM/CoTM_no.json
+    sampling_strategy: repeat:2
+  - json_path: /home/yz/code/Triad-main/movable/InstructIAD/InstructIAD.json
+    sampling_strategy: all
+  # Extra 1x InstructIAD normals → normals ~2x overall
+  - json_path: /home/yz/code/Triad-main/movable/InstructIAD/InstructIAD_normal.json
+    sampling_strategy: repeat:1

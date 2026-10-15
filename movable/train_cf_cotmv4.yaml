@@ -1,0 +1,11 @@
+# CoTM_v4 (v3 + CF gt_occlude No + bg_occlude Yes controls) + InstructIAD.
+# Loss stays decision_token (see finetune_ov_0shot.sh); no CoTM_v3_no repeat —
+# CF already injects paired Nos. Mild IAD normal upsample kept.
+# Rebuild JSON/images: python3 scripts/build_cotm_v4.py
+datasets:
+  - json_path: /home/yz/code/Triad-main/movable/CoTM/CoTM_v4.json
+    sampling_strategy: all
+  - json_path: /home/yz/code/Triad-main/movable/InstructIAD/InstructIAD.json
+    sampling_strategy: all
+  - json_path: /home/yz/code/Triad-main/movable/InstructIAD/InstructIAD_normal.json
+    sampling_strategy: repeat:1

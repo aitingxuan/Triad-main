@@ -1,0 +1,433 @@
+{
+  "banana_juice": {
+    "steps": {
+      "1": "Banana Selection and Preparation",
+      "2": "Juicing",
+      "3": "Pasteurization",
+      "4": "Bottle Preparation",
+      "5": "Filling",
+      "6": "Label Design and Application"
+    },
+    "defects": {
+      "invalid_juice_type": {
+        "step": 2,
+        "step_name": "Juicing",
+        "type_text": "Invalid Juice Type",
+        "location": "center",
+        "rationale": "Wrong juice identity / appearance after extraction and filtering"
+      },
+      "discolor_juice": {
+        "step": 3,
+        "step_name": "Pasteurization",
+        "type_text": "Discolor Juice",
+        "location": "center",
+        "rationale": "Color hold depends on pasteurization / enzyme halt"
+      },
+      "too_little_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "type_text": "Too Little Juice",
+        "location": "center",
+        "rationale": "Fill level"
+      },
+      "too_much_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "type_text": "Too Much Juice",
+        "location": "center",
+        "rationale": "Fill level"
+      },
+      "missing_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "type_text": "Missing Juice",
+        "location": "center",
+        "rationale": "Empty / unfilled bottle"
+      },
+      "foreign_object_in_juice": {
+        "step": 5,
+        "step_name": "Filling",
+        "type_text": "Foreign Object In Juice",
+        "location": "center",
+        "rationale": "Contaminant visible in filled liquid"
+      },
+      "missing_top_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Missing Top Label",
+        "location": "center",
+        "rationale": "Top banana label missing"
+      },
+      "missing_bottom_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Missing Bottom Label",
+        "location": "bottom",
+        "rationale": "Bottom 100% Juice label missing"
+      },
+      "missing_two_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Missing Two Label",
+        "location": "center",
+        "rationale": "Both labels missing"
+      },
+      "broken_top_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Broken Top Label",
+        "location": "top",
+        "rationale": "Top label tear / chip"
+      },
+      "broken_bottom_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Broken Bottom Label",
+        "location": "bottom",
+        "rationale": "Bottom label tear / chip"
+      },
+      "broken_two_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Broken Two Label",
+        "location": "center",
+        "rationale": "Both labels damaged"
+      },
+      "top_label_missing_logo": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Top Label Missing Logo",
+        "location": "top",
+        "rationale": "Print / design of top label incomplete"
+      },
+      "top_label_skewed_logo": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Top Label Skewed Logo",
+        "location": "top",
+        "rationale": "Logo placement on top label"
+      },
+      "wrong_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Wrong Label",
+        "location": "center",
+        "rationale": "Incorrect label content / design"
+      },
+      "discolored_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Discolored Label",
+        "location": "center",
+        "rationale": "Label print / color defect"
+      },
+      "invalid_label_position": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Invalid Label Position",
+        "location": "center",
+        "rationale": "Label application alignment"
+      },
+      "top_bottom_label_position_transform": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Top Bottom Label Position Transform",
+        "location": "center",
+        "rationale": "Top/bottom labels swapped or transformed"
+      },
+      "foreign_object_on_label": {
+        "step": 6,
+        "step_name": "Label Design and Application",
+        "type_text": "Foreign Object On Label",
+        "location": "top",
+        "rationale": "Contamination on label surface after application"
+      }
+    }
+  },
+  "cherry_juice": {
+    "steps": {
+      "1": "Cherry Juice Production",
+      "2": "Glass Bottle Production",
+      "3": "Label Application",
+      "4": "Filling the Bottle"
+    },
+    "defects": {
+      "invalid_juice_type": {
+        "step": 1,
+        "step_name": "Cherry Juice Production",
+        "type_text": "Invalid Juice Type",
+        "location": "center",
+        "rationale": "Selection / extraction / appearance of cherry juice"
+      },
+      "discolor_juice": {
+        "step": 1,
+        "step_name": "Cherry Juice Production",
+        "type_text": "Discolor Juice",
+        "location": "center",
+        "rationale": "Juice color from selection / extraction / pasteurization"
+      },
+      "too_little_juice": {
+        "step": 4,
+        "step_name": "Filling the Bottle",
+        "type_text": "Too Little Juice",
+        "location": "center",
+        "rationale": "Fill level"
+      },
+      "too_much_juice": {
+        "step": 4,
+        "step_name": "Filling the Bottle",
+        "type_text": "Too Much Juice",
+        "location": "center",
+        "rationale": "Fill level"
+      },
+      "missing_juice": {
+        "step": 4,
+        "step_name": "Filling the Bottle",
+        "type_text": "Missing Juice",
+        "location": "center",
+        "rationale": "Empty / unfilled bottle"
+      },
+      "foreign_object_in_juice": {
+        "step": 4,
+        "step_name": "Filling the Bottle",
+        "type_text": "Foreign Object In Juice",
+        "location": "center",
+        "rationale": "Contaminant in filled liquid"
+      },
+      "missing_top_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Missing Top Label",
+        "location": "center",
+        "rationale": "Top cherry label missing"
+      },
+      "missing_bottom_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Missing Bottom Label",
+        "location": "bottom",
+        "rationale": "Bottom label missing"
+      },
+      "missing_two_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Missing Two Label",
+        "location": "center",
+        "rationale": "Both labels missing"
+      },
+      "broken_top_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Broken Top Label",
+        "location": "top",
+        "rationale": "Top label damage"
+      },
+      "broken_bottom_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Broken Bottom Label",
+        "location": "bottom",
+        "rationale": "Bottom label damage"
+      },
+      "broken_two_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Broken Two Label",
+        "location": "center",
+        "rationale": "Both labels damaged"
+      },
+      "top_label_missing_logo": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Top Label Missing Logo",
+        "location": "top",
+        "rationale": "Top label print incomplete"
+      },
+      "top_label_skewed_logo": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Top Label Skewed Logo",
+        "location": "top",
+        "rationale": "Logo / label placement"
+      },
+      "wrong_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Wrong Label",
+        "location": "center",
+        "rationale": "Incorrect label"
+      },
+      "discolored_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Discolored Label",
+        "location": "center",
+        "rationale": "Label color defect"
+      },
+      "invalid_label_position": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Invalid Label Position",
+        "location": "center",
+        "rationale": "Label alignment"
+      },
+      "top_bottom_label_position_transform": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Top Bottom Label Position Transform",
+        "location": "center",
+        "rationale": "Top/bottom label placement error"
+      },
+      "foreign_object_on_label": {
+        "step": 3,
+        "step_name": "Label Application",
+        "type_text": "Foreign Object On Label",
+        "location": "top",
+        "rationale": "Contamination on label"
+      }
+    }
+  },
+  "orange_juice": {
+    "steps": {
+      "1": "Juice Production",
+      "2": "Glass Bottle Production",
+      "3": "Label Production",
+      "4": "Assembly Process"
+    },
+    "defects": {
+      "invalid_juice_type": {
+        "step": 1,
+        "step_name": "Juice Production",
+        "type_text": "Invalid Juice Type",
+        "location": "center",
+        "rationale": "Juicing / blending appearance"
+      },
+      "discolor_juice": {
+        "step": 1,
+        "step_name": "Juice Production",
+        "type_text": "Discolor Juice",
+        "location": "center",
+        "rationale": "Juice color from production / blending"
+      },
+      "too_little_juice": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Too Little Juice",
+        "location": "center",
+        "rationale": "Bottle filling in assembly"
+      },
+      "too_much_juice": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Too Much Juice",
+        "location": "center",
+        "rationale": "Bottle filling in assembly"
+      },
+      "missing_juice": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Missing Juice",
+        "location": "center",
+        "rationale": "Unfilled bottle in assembly"
+      },
+      "foreign_object_in_juice": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Foreign Object In Juice",
+        "location": "center",
+        "rationale": "Contaminant after filling"
+      },
+      "top_label_missing_logo": {
+        "step": 3,
+        "step_name": "Label Production",
+        "type_text": "Top Label Missing Logo",
+        "location": "top",
+        "rationale": "Print content of top label"
+      },
+      "wrong_label": {
+        "step": 3,
+        "step_name": "Label Production",
+        "type_text": "Wrong Label",
+        "location": "center",
+        "rationale": "Wrong printed label design"
+      },
+      "discolored_label": {
+        "step": 3,
+        "step_name": "Label Production",
+        "type_text": "Discolored Label",
+        "location": "center",
+        "rationale": "Label print color"
+      },
+      "broken_top_label": {
+        "step": 3,
+        "step_name": "Label Production",
+        "type_text": "Broken Top Label",
+        "location": "top",
+        "rationale": "Damaged printed top label stock"
+      },
+      "broken_bottom_label": {
+        "step": 3,
+        "step_name": "Label Production",
+        "type_text": "Broken Bottom Label",
+        "location": "bottom",
+        "rationale": "Damaged printed bottom label stock"
+      },
+      "broken_two_label": {
+        "step": 3,
+        "step_name": "Label Production",
+        "type_text": "Broken Two Label",
+        "location": "center",
+        "rationale": "Damaged printed labels"
+      },
+      "missing_top_label": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Missing Top Label",
+        "location": "center",
+        "rationale": "Label application in assembly"
+      },
+      "missing_bottom_label": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Missing Bottom Label",
+        "location": "bottom",
+        "rationale": "Label application in assembly"
+      },
+      "missing_two_label": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Missing Two Label",
+        "location": "center",
+        "rationale": "Both labels not applied"
+      },
+      "invalid_label_position": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Invalid Label Position",
+        "location": "center",
+        "rationale": "Application alignment"
+      },
+      "top_bottom_label_position_transform": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Top Bottom Label Position Transform",
+        "location": "center",
+        "rationale": "Application placement error"
+      },
+      "top_label_skewed_logo": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Top Label Skewed Logo",
+        "location": "top",
+        "rationale": "Skew from application / adhesion"
+      },
+      "foreign_object_on_label": {
+        "step": 4,
+        "step_name": "Assembly Process",
+        "type_text": "Foreign Object On Label",
+        "location": "top",
+        "rationale": "Contamination during / after labeling"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# CoTM_v5 (= CoTM.json mixed corpus + process-aligned pseudo Yes) + InstructIAD.
+# Rebuild: python3 scripts/build_process_pseudo.py --full --all-defects
+# No TNR No×3 / normal upsample (vis_ori-style mix).
+datasets:
+  - json_path: /home/yz/code/Triad-main/movable/CoTM/CoTM_v5.json
+    sampling_strategy: all
+  - json_path: /home/yz/code/Triad-main/movable/InstructIAD/InstructIAD.json
+    sampling_strategy: all
