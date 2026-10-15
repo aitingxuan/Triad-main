@@ -25,10 +25,6 @@ if is_datasets_available():
     import datasets
 
 from llava.utils import rank0_print
-from llava.train.decision_token_loss import (
-    build_decision_token_id_sets,
-    compute_decision_weighted_ce,
-)
 from llava.train.ecpr_aux_loss import (
     EcprLocalAggHead,
     compute_ecpr_chain_ce,
@@ -299,20 +295,18 @@ class LLaVATrainer(Trainer):
             p.requires_grad = True
         return head
 
-    def _decision_token_loss_enabled(self) -> bool:
-        return bool(getattr(self.args, "decision_token_loss", False))
-
     def _ecpr_aux_loss_enabled(self) -> bool:
         return bool(getattr(self.args, "ecpr_aux_loss", False))
 
     def _get_decision_token_ids(self):
         if self._decision_token_ids is None:
+            from llava.train.ecpr_aux_loss import build_decision_token_id_sets as _build_ids
             tokenizer = getattr(self, "tokenizer", None) or getattr(self, "processing_class", None)
             if tokenizer is None:
-                raise RuntimeError("decision_token_loss/ecpr_aux_loss requires trainer.tokenizer")
-            self._decision_token_ids = build_decision_token_id_sets(tokenizer)
+                raise RuntimeError("ecpr_aux_loss requires trainer.tokenizer")
+            self._decision_token_ids = _build_ids(tokenizer)
             no_ids, yes_ids = self._decision_token_ids
-            rank0_print(f"decision_token_loss token ids: no={sorted(no_ids)} yes={sorted(yes_ids)}")
+            rank0_print(f"ecpr token ids: no={sorted(no_ids)} yes={sorted(yes_ids)}")
         return self._decision_token_ids
 
     def _get_ecpr_local_head(self, device):
@@ -327,24 +321,23 @@ class LLaVATrainer(Trainer):
         return self._ecpr_local_head
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-        if self._ecpr_aux_loss_enabled() or self._decision_token_loss_enabled():
+        if self._ecpr_aux_loss_enabled():
             # Multimodal: text `labels` are much shorter than logits (IMAGE_TOKEN expanded).
             # LlavaQwen `dpo_forward=True` returns (logits, expanded_labels) with matching T.
             model_inputs = {k: v for k, v in inputs.items() if k not in ("num_items_in_batch", "ecpr_metas")}
             result = model(**model_inputs, dpo_forward=True)
             if not (isinstance(result, tuple) and len(result) >= 2):
                 raise RuntimeError(
-                    "decision_token_loss/ecpr_aux_loss expects model(..., dpo_forward=True) -> (logits, labels); "
+                    "ecpr_aux_loss expects model(..., dpo_forward=True) -> (logits, labels); "
                     f"got {type(result)}"
                 )
             logits, exp_labels = result[0], result[1]
             if exp_labels is None:
                 exp_labels = inputs["labels"]
-            no_ids, yes_ids = self._get_decision_token_ids()
             tokenizer = getattr(self, "tokenizer", None) or getattr(self, "processing_class", None)
+            no_ids, yes_ids = self._get_decision_token_ids()
 
-            if self._ecpr_aux_loss_enabled():
-                loss, stats = compute_ecpr_chain_ce(
+            loss, stats = compute_ecpr_chain_ce(
                     logits,
                     exp_labels,
                     inputs.get("ecpr_metas"),
@@ -389,30 +382,6 @@ class LLaVATrainer(Trainer):
                                     "ecpr/local_n": local_stats.get("n", 0.0),
                                     "ecpr/local_acc": local_stats.get("acc", 0.0),
                                     "ecpr/total_loss": float(loss.detach().item()),
-                                }
-                            )
-                        except Exception:
-                            pass
-            else:
-                loss, stats = compute_decision_weighted_ce(
-                    logits,
-                    exp_labels,
-                    no_ids,
-                    yes_ids,
-                    no_weight=float(getattr(self.args, "decision_token_no_weight", 3.0)),
-                    yes_weight=float(getattr(self.args, "decision_token_yes_weight", 1.0)),
-                    num_items_in_batch=num_items_in_batch,
-                )
-                if self.accelerator.sync_gradients:
-                    log_every = max(1, int(getattr(self.args, "decision_token_log_every", 50)))
-                    if self.state.global_step % log_every == 0:
-                        try:
-                            self.log(
-                                {
-                                    "decision_tok/loss": stats["loss"],
-                                    "decision_tok/n_no": stats["n_no"],
-                                    "decision_tok/n_yes": stats["n_yes"],
-                                    "decision_tok/mean_w": stats["mean_w"],
                                 }
                             )
                         except Exception:

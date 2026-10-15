@@ -29,11 +29,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from llava.constants import IGNORE_INDEX
-from llava.train.decision_token_loss import (
-    _id_mask,
-    _last_decision_mask,
-    build_decision_token_id_sets,
-)
+
+
+def _id_mask(flat_labels, ids):
+    m = flat_labels.new_zeros(flat_labels.shape, dtype=torch.bool)
+    for _id in ids:
+        m |= flat_labels == int(_id)
+    return m
+
+
+def build_decision_token_id_sets(tokenizer):
+    no_ids, yes_ids = set(), set()
+    for txt in ["Yes", " yes", "YES", "No", " no", "NO"]:
+        try:
+            tids = tokenizer.encode(txt, add_special_tokens=False)
+        except Exception:
+            continue
+        for t in tids:
+            if "yes" in txt.lower():
+                yes_ids.add(int(t))
+            else:
+                no_ids.add(int(t))
+    return no_ids, yes_ids
+
+
+def _last_decision_mask(shift_labels, decision_ids):
+    B, T = shift_labels.shape
+    mask = torch.zeros((B, T), dtype=torch.bool, device=shift_labels.device)
+    d = set(int(x) for x in decision_ids)
+    for b in range(B):
+        for t in range(T - 1, -1, -1):
+            v = int(shift_labels[b, t].item())
+            if v == IGNORE_INDEX:
+                continue
+            if v in d:
+                mask[b, t] = True
+            break
+    return mask
 
 
 _TAG_LOC = re.compile(r"<location>\s*(.*?)\s*</location>", re.IGNORECASE | re.DOTALL)

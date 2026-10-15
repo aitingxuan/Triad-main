@@ -5897,12 +5897,6 @@ class TrainingArguments(transformers.TrainingArguments):
     prefetch_factor: int = 2
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
 
-    # Decision-token CE reweighting (raise TNR / cut Yes bias).
-    decision_token_loss: bool = field(default=False, metadata={"help": "Reweight CE on Yes/No answer tokens."})
-    decision_token_no_weight: float = field(default=3.0, metadata={"help": "CE weight for No decision tokens."})
-    decision_token_yes_weight: float = field(default=1.0, metadata={"help": "CE weight for Yes decision tokens."})
-    decision_token_log_every: int = field(default=50, metadata={"help": "Log decision_tok/* every N optimizer steps."})
-
     # ECPR Week-2 aux: chain token CE + soft local-agg head (docs/EG_CONDITIONAL_PART_ROI.md §6).
     ecpr_aux_loss: bool = field(default=False, metadata={"help": "Enable ECPR localize/attr/agg token CE + local-agg BCE."})
     ecpr_lambda_localize: float = field(default=0.5, metadata={"help": "Extra weight on location/type tokens."})

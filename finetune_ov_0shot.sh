@@ -115,10 +115,6 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="2" --nnodes="1" --master_ad
     --torch_compile False \
     --torch_compile_backend "inductor" \
     --attn_implementation sdpa \
-    --decision_token_loss True \
-    --decision_token_no_weight 1.0 \
-    --decision_token_yes_weight 1.0 \
-    --decision_token_log_every 50 \
     --dataloader_drop_last True \
     "${ECPR_ARGS[@]}" \
     --report_to tensorboard 2>&1 | tee tmp_log/llava_train_$(date "+%Y%m%d_%H%M%S").log
