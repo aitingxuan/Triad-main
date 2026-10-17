@@ -393,8 +393,9 @@ class SimpleModelWorker:
                         overlay_dir = requery.get("overlay_dir")
                         overlay_path = None
                         if overlay_dir:
-                            safe_id = re.sub(r"[^\w.\-]+", "_", str(params.get("sample_id") or "sample"))[:120]
-                            overlay_path = os.path.join(overlay_dir, f"{safe_id}.png")
+                            safe_id = re.sub(r"[^\w.\-]+", "_", str(params.get("sample_id") or "sample"))[:100]
+                            safe_sub = re.sub(r"[^\w.\-]+", "_", str(subset or "sub"))[:40]
+                            overlay_path = os.path.join(overlay_dir, f"{safe_sub}__{safe_id}.png")
 
                         attn_meta = None
                         box = None
@@ -702,6 +703,7 @@ class SimpleModelWrapper:
                 "ab_tau": inputs.get("ab_tau", None),
                 "requery": inputs.get("requery", None),
                 "subset": inputs.get("subset", None),
+                "sample_id": inputs.get("sample_id", None),
                 "conv_template": self.template_name,
                 "main_text": inputs.get("text", None),
             }).strip()

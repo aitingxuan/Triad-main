@@ -57,7 +57,7 @@ bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
 # Default_v4 (requeryAttnCrop): decision-token attention -> suspect box -> crop high-fidelity
 # ROI from the ORIGINAL image (EG-RoI view layout) -> default_v2 checklist re-asked on the crop.
 # Attention only proposes the box; VLM A/B still decides. Quantile top-~10% hardest.
-# Attention-overlay + crop-box PNGs land in results/<exp>/attncrop_overlays_mvtec__musc_v0/.
+# Attention-overlay + crop-box PNGs land in results/<exp>/attncrop_overlays_mvtec_all_v0/.
 # bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
 #   "$model_path" "$exp_name" v0 "$gpu" mvtec _musc all 0 scheme_requery_default_v4
 # bash scripts/eval_triad_0shot_v_gpu_dataset_expert_prod.sh \
