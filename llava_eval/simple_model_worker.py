@@ -2,6 +2,7 @@ import json
 import time
 import math
 import os
+import re
 import torch
 from tqdm import tqdm
 import requests
@@ -110,6 +111,10 @@ class SimpleModelWorker:
         images = params.get("images", None)
         masks = params.get("masks", None)
         boxes_list = params.get("boxes_list", None)
+        # Keep the raw PIL inputs so attention-guided (attncrop) re-crops can
+        # re-run process_images on the ORIGINAL image with a new ROI box.
+        raw_images = images if isinstance(images, list) else None
+        raw_masks = masks
         num_image_tokens = 0
         if images is not None and len(images) > 0 and self.is_multimodal:
             if len(images) > 0:
@@ -189,8 +194,11 @@ class SimpleModelWorker:
                 p_a, p_b = two_way_softmax(z_a, z_b)
                 return z_a, z_b, p_a, p_b
 
-            def _ab_forward_prompt(prompt_str):
-                """Single-token A/B score on the same processed image_args as the main Q."""
+            def _ab_forward_prompt(prompt_str, ia=None):
+                """Single-token A/B score on the same processed image_args as the main Q.
+
+                Pass ``ia`` to score on a different view set (e.g. an attention-cropped ROI).
+                """
                 ids = tokenizer_image_token(
                     prompt_str, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
                 ).unsqueeze(0).to(self.device)
@@ -201,7 +209,7 @@ class SimpleModelWorker:
                     use_cache=True,
                     output_scores=True,
                     return_dict_in_generate=True,
-                    **image_args,
+                    **(ia if ia is not None else image_args),
                 )
                 return _ab_from_logits(gen.scores[0][0].float())
 
@@ -229,9 +237,10 @@ class SimpleModelWorker:
             gate_name = "band"
             if requery is not None:
                 mode = str(requery.get("mode", "hyp")).lower()
-                if mode not in ("hyp", "hyp_v2", "selfq"):
+                if mode not in ("hyp", "hyp_v2", "selfq", "attncrop"):
                     raise ValueError(
-                        f"Unsupported requery mode={mode!r}; expected 'hyp', 'hyp_v2' or 'selfq'."
+                        f"Unsupported requery mode={mode!r}; expected 'hyp', 'hyp_v2', "
+                        f"'selfq' or 'attncrop'."
                     )
                 lo = float(requery.get("lo", 0.4))
                 hi = float(requery.get("hi", 0.7))
@@ -367,6 +376,121 @@ class SimpleModelWorker:
                         ev = float(fused["evidence_logit"])
                         S_A = ev if ev > 0 else 0.0
                         S_B = -ev if ev < 0 else 0.0
+                    elif mode == "attncrop":
+                        # Default_v4: attention-guided suspect box -> crop a high-fidelity
+                        # ROI from the ORIGINAL image (reusing the EG-RoI view layout via
+                        # process_images(boxes_list=...)), then run the default_v2 checklist
+                        # (H_A/H_B) on that crop. The attention map only PROPOSES the box;
+                        # the final decision is still the VLM A/B sub-answers (never MuSc).
+                        from attn_crop import extract_attn_box_prepared
+
+                        ac_cl = str(requery.get("checklist", "default")).lower()
+                        ac_checklist = get_hyp_checklist(subset, checklist=ac_cl)
+                        ac_max_subq = int(requery.get("max_subq", 3))
+                        ha_qs = list(ac_checklist.get("H_A") or [])[: max(0, ac_max_subq)]
+                        hb_qs = list(ac_checklist.get("H_B") or [])[: max(0, ac_max_subq)]
+
+                        overlay_dir = requery.get("overlay_dir")
+                        overlay_path = None
+                        if overlay_dir:
+                            safe_id = re.sub(r"[^\w.\-]+", "_", str(params.get("sample_id") or "sample"))[:120]
+                            overlay_path = os.path.join(overlay_dir, f"{safe_id}.png")
+
+                        attn_meta = None
+                        box = None
+                        if raw_images is not None and len(raw_images) == 1:
+                            try:
+                                gen_tid = int(ab_ids[llm_letter][0])
+                                attn_meta = extract_attn_box_prepared(
+                                    model,
+                                    image_args["images"],
+                                    raw_images[0],
+                                    image_sizes,
+                                    image_args.get("roi_bboxes"),
+                                    input_ids,
+                                    gen_tid,
+                                    layers=str(requery.get("attncrop_layers", "midband")),
+                                    thr_q=float(requery.get("attncrop_thr_q", 0.90)),
+                                    expand=float(requery.get("attncrop_expand", 1.3)),
+                                    side_lo=float(requery.get("attncrop_side_lo", 0.06)),
+                                    side_hi=float(requery.get("attncrop_side_hi", 0.45)),
+                                    conc_floor=float(requery.get("attncrop_conc_floor", 0.30)),
+                                    overlay_path=overlay_path,
+                                    overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
+                                )
+                            except Exception as e:
+                                attn_meta = {"kept": False, "reason": f"error:{e}", "box": None}
+                        else:
+                            attn_meta = {"kept": False, "reason": "multi_image", "box": None}
+
+                        if attn_meta and attn_meta.get("kept"):
+                            box = attn_meta.get("box")
+
+                        if box is not None:
+                            crop_images, crop_roi = process_images(
+                                raw_images,
+                                image_processor,
+                                model.config,
+                                masks=raw_masks,
+                                boxes_list=[[box]],
+                                return_bboxes=True,
+                            )
+                            if isinstance(crop_images, list):
+                                crop_images = [im.to(model.device, dtype=model.dtype) for im in crop_images]
+                            else:
+                                crop_images = crop_images.to(model.device, dtype=model.dtype)
+                            ia_crop = {
+                                "images": crop_images,
+                                "image_sizes": image_sizes,
+                                "roi_bboxes": crop_roi,
+                            }
+                            for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
+                                for q in qlist:
+                                    _, _, sp_a, sp_b = _ab_forward_prompt(_build_sub_prompt(q), ia_crop)
+                                    conf = max(sp_a, sp_b)
+                                    ans_letter = "A" if sp_a >= 0.5 else "B"
+                                    sub_records.append({
+                                        "hyp": hyp_tag,
+                                        "q": q,
+                                        "p_A": sp_a,
+                                        "p_B": sp_b,
+                                        "letter": ans_letter,
+                                        "conf": conf,
+                                        "kept": conf >= tau_ev,
+                                        "view": "attncrop",
+                                    })
+                            for rec in sub_records:
+                                if not rec.get("kept"):
+                                    continue
+                                if rec["hyp"] == "H_A":
+                                    if rec["letter"] == "A":
+                                        S_A += 1.0
+                                    else:
+                                        S_B += 1.0
+                                else:
+                                    if rec["letter"] == "A":
+                                        S_B += 1.0
+                                    else:
+                                        S_A += 1.0
+                            if S_A - S_B >= delta:
+                                letter = "A"
+                                decision_src = "attncrop_test"
+                            elif S_B - S_A >= delta:
+                                letter = "B"
+                                decision_src = "attncrop_test"
+                            else:
+                                letter = llm_letter
+                                decision_src = "attncrop_fallback"
+                        else:
+                            letter = llm_letter
+                            decision_src = "attncrop_fallback_nobox"
+
+                        hyp_v2_diag = {
+                            "mode": "attncrop",
+                            "box": box,
+                            "used_crop": box is not None,
+                            "attn": attn_meta,
+                        }
                     else:
                         cl_key = str(requery.get("checklist", "per_class")).lower()
                         checklist = get_hyp_checklist(subset, checklist=cl_key)
@@ -456,6 +580,13 @@ class SimpleModelWorker:
                 "selfq": (
                     hyp_v2_diag.get("selfq")
                     if (requery is not None and str((requery or {}).get("mode", "")).lower() == "selfq"
+                        and isinstance(hyp_v2_diag, dict))
+                    else None
+                ),
+                "attncrop": (
+                    hyp_v2_diag
+                    if (requery is not None
+                        and str((requery or {}).get("mode", "")).lower() == "attncrop"
                         and isinstance(hyp_v2_diag, dict))
                     else None
                 ),

@@ -203,6 +203,71 @@ scheme_requery_selfq:0.1:2
 
 ---
 
+## 方案 5：注意力引导裁图 + default_v2 追问（`attncrop` / `requeryAttnCrop`，default_v4，已实现）
+
+> 复用 EG-RoI 视图框架：只用 decision-token 注意力**供框**，框交给 `process_images(boxes_list=...)` 从**原图**裁高保真 ROI，再把 `default_v2` 清单在裁剪视图上重问。注意力**不做裁判**，最终仍由 VLM A/B 决定（永不 `musc_scores`）。
+
+### 5.1 数据流
+
+```text
+主路 全图 anyres+randomroi → 单token A/B → p_f, llm_letter
+  │ 量化门(quantile top_frac，默认0.1) 选中困难例
+  ▼
+attn_crop：只读Q/K 取 decision-token 在 midband 层的注意力
+  → 平均层→anyres网格→去sink→top5%质量门(conc_floor)→最大质量连通域
+  → 正方形外扩(expand) + 面积clip[side_lo,side_hi] → suspect box
+  ▼
+process_images(raw_images, boxes_list=[[box]]) 从原图裁 ROI（EG-RoI 多视图）
+  ▼
+default_v2 清单(H_A/H_B×3) 在裁剪视图上 forced A/B → 硬计票 S_A/S_B
+  ▼
+|S_A-S_B|>=delta → 翻案(attncrop_test)；否则回退 llm_letter(attncrop_fallback)
+```
+
+### 5.2 关键约束（全部相对，无绝对阈值）
+
+- **层**：`midband`（默认，≈0.50/0.57/0.64/0.71·n）；可 `mid|last|last4|逗号列表`。
+- **供框门**：`attncrop_conc_floor`（top5% 质量，默认 0.30）——散的直接不出框，落回全图。
+- **框**：`thr_q=0.90` 相对阈值、`expand=1.3`、面积 `[0.06,0.45]·min(W,H)`；从原图裁，偏大宁可含上下文。
+- **冻结约束**：不读 `musc_scores`；`slot` 由注意力框提供，判据仍是 VLM。
+
+### 5.3 代码入口
+
+| 位置 | 作用 |
+|---|---|
+| `eval_0shot_path.sh` / `scripts/...prod.sh` | mode `scheme_requery_default_v4[:top_frac]`（tag `requeryAttnCrop`） |
+| `llava_eval/evaluate.py` | `--scheme_requery attncrop`；`--requery_attncrop_{layers,thr_q,expand,side_lo,side_hi,conc_floor,overlay_dir}` |
+| `llava_eval/simple_model_worker.py` | `mode="attncrop"` 分支：注意力→框→裁图→default_v2 追问→硬计票 |
+| `llava_eval/attn_crop.py` | 只读Q/K `score_layers`、`SegmentRecorder`、`grid_to_box`、`save_attn_box_overlay` |
+
+Sidecar 额外：`attncrop{box,used_crop,attn{kept,reason,top5_mass,area_frac,layers}}`。  
+`decision_src`：`attncrop_test` | `attncrop_fallback` | `attncrop_fallback_nobox`。
+
+### 5.4 注意力叠加可视化
+
+`--requery_attncrop_overlay_dir <dir>` 开时，每个被选中样本输出一张三栏 PNG：`original(+红框) | 注意力热力叠加(+红框) | crop`。
+
+### 5.5 推荐调用
+
+```text
+# shell：
+scheme_requery_default_v4              # 默认 quantile top 0.1
+scheme_requery_default_v4:0.1
+
+# evaluate.py 直连：
+--scheme_requery attncrop --requery_checklist default --requery_gate quantile \
+  --requery_top_frac 0.1 --requery_max_subq 3 \
+  --requery_attncrop_layers midband --requery_attncrop_overlay_dir results/attncrop_viz
+```
+
+### 5.6 消融建议
+
+- `attncrop_layers`∈{midband, mid, last4}；`conc_floor`∈{0.2,0.3}；
+- `expand`∈{1.2,1.3,1.5}；`side_hi`∈{0.35,0.45}；
+- 对比 `scheme_requery_default_v2`（不裁图）；重点看选中集 Acc/TNR、**翻对 vs 误伤**、`decision_src` 分布、`used_crop` 比例。
+
+---
+
 ## 组合与落地优先级
 
 | 优先级 | 组合 | 状态 |
@@ -212,6 +277,7 @@ scheme_requery_selfq:0.1:2
 | **P1b** | **方案 3b 软聚合 hyp_v2** | **已落地** |
 | **P1c** | **方案 3c Defv3（quantile + contrastive）** | **已落地** |
 | **P1d** | **方案 4 selfq（T2 自生成 + 贝叶斯融合，无绝对阈值）** | **已落地** |
+| **P1e** | **方案 5 default_v4（注意力裁图 + default_v2 追问，attncrop）** | **已落地** |
 | P2 | 方案 1 完整 ReCoVERR（开放出题，多轮反驳） | 未做 |
 | 兜底 | 证据仍不足 → **回退全图 llm_letter** | **禁止** `musc_scores` |
 

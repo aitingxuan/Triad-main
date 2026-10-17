@@ -201,13 +201,16 @@ if __name__ == "__main__":
         "--scheme_requery",
         type=str,
         default=None,
-        choices=["hyp", "hyp_v2", "selfq"],
+        choices=["hyp", "hyp_v2", "selfq", "attncrop"],
         help=(
             "Hypothesis requery (v0 only). NEVER musc_scores. "
             "hyp: fixed-template H_A/H_B, hard +1 aggregate. "
             "hyp_v2: fixed-template, soft votes + pair antisymmetry + p_f mix. "
             "selfq: model WRITES its own yes/no check (T2), answered by forced two-choice "
             "readout, entropy-gated + Bayesian logit fusion (no tau_ev/band/delta). "
+            "attncrop (default_v4): attention-guided suspect box -> crop a high-fidelity ROI "
+            "from the ORIGINAL image via the EG-RoI view layout, then the default_v2 checklist "
+            "is re-asked on that crop. Attention only proposes the box; VLM A/B still decides. "
             "Selection: --requery_gate band (default) or quantile (Defv3). "
             "Fallback to llm_letter. Mutually exclusive with --ab_tau."
         ),
@@ -312,6 +315,49 @@ if __name__ == "__main__":
         help="selfq: max new tokens when the model writes its own question. Default 64.",
     )
     parser.add_argument(
+        "--requery_attncrop_layers",
+        type=str,
+        default="midband",
+        help="attncrop: attention layer spec. midband(default)|mid|last|last4|comma list.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_thr_q",
+        type=float,
+        default=0.90,
+        help="attncrop: relative quantile threshold on the normalized anyres grid. Default 0.90.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_expand",
+        type=float,
+        default=1.3,
+        help="attncrop: square box expansion factor around the attention blob. Default 1.3.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_side_lo",
+        type=float,
+        default=0.06,
+        help="attncrop: min box side as a fraction of the short image side. Default 0.06.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_side_hi",
+        type=float,
+        default=0.45,
+        help="attncrop: max box side as a fraction of the short image side. Default 0.45.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_conc_floor",
+        type=float,
+        default=0.30,
+        help="attncrop: min top-5%% attention mass to accept a box (else diffuse -> no crop). "
+        "Default 0.30.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_overlay_dir",
+        type=str,
+        default=None,
+        help="attncrop: if set, write attention-overlay + crop-box PNGs (per sample id) here.",
+    )
+    parser.add_argument(
         "--ecpr_sidecar",
         type=str,
         default=None,
@@ -391,6 +437,22 @@ if __name__ == "__main__":
                 "conflict_ratio": float(args.requery_v2_conflict_ratio),
                 "soft_temp": float(args.requery_v2_temp),
             })
+        if mode == "attncrop":
+            # default_v4: default checklist + all 3 geometry pairs unless overridden.
+            if str(args.requery_checklist) == "per_class":
+                requery["checklist"] = "default"
+            requery["max_subq"] = int(args.requery_max_subq) if args.requery_max_subq != 2 else 3
+            requery.update({
+                "attncrop_layers": str(args.requery_attncrop_layers),
+                "attncrop_thr_q": float(args.requery_attncrop_thr_q),
+                "attncrop_expand": float(args.requery_attncrop_expand),
+                "attncrop_side_lo": float(args.requery_attncrop_side_lo),
+                "attncrop_side_hi": float(args.requery_attncrop_side_hi),
+                "attncrop_conc_floor": float(args.requery_attncrop_conc_floor),
+                "overlay_dir": args.requery_attncrop_overlay_dir,
+            })
+            if args.requery_attncrop_overlay_dir:
+                os.makedirs(args.requery_attncrop_overlay_dir, exist_ok=True)
     if ab_tau is not None:
         if prompt_version != "v0":
             raise ValueError(
@@ -593,6 +655,7 @@ if __name__ == "__main__":
             "ab_tau": ab_tau,
             "requery": requery_cfg,
             "subset": subset,
+            "sample_id": d.get("id"),
         }
 
         assert worker is not None
