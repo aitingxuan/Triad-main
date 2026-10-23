@@ -352,6 +352,27 @@ if __name__ == "__main__":
         "Default 0.30.",
     )
     parser.add_argument(
+        "--requery_attncrop_proposer",
+        type=str,
+        default="margin_cam",
+        choices=["margin_cam", "attn"],
+        help="attncrop proposer: margin_cam (A/B margin Grad-CAM, pure model, default) "
+        "or attn (old decision-token attention).",
+    )
+    parser.add_argument(
+        "--requery_attncrop_cam_thr_q",
+        type=float,
+        default=0.60,
+        help="margin_cam: relative threshold on the normalized CAM grid for the blob. Default 0.60.",
+    )
+    parser.add_argument(
+        "--requery_attncrop_cam_conc_floor",
+        type=float,
+        default=0.25,
+        help="margin_cam: min top-5%% CAM mass to accept a box (else degenerate -> no crop). "
+        "Default 0.25.",
+    )
+    parser.add_argument(
         "--requery_attncrop_overlay_dir",
         type=str,
         default=None,
@@ -443,12 +464,15 @@ if __name__ == "__main__":
                 requery["checklist"] = "default"
             requery["max_subq"] = int(args.requery_max_subq) if args.requery_max_subq != 2 else 3
             requery.update({
+                "attncrop_proposer": str(args.requery_attncrop_proposer),
                 "attncrop_layers": str(args.requery_attncrop_layers),
                 "attncrop_thr_q": float(args.requery_attncrop_thr_q),
+                "attncrop_cam_thr_q": float(args.requery_attncrop_cam_thr_q),
                 "attncrop_expand": float(args.requery_attncrop_expand),
                 "attncrop_side_lo": float(args.requery_attncrop_side_lo),
                 "attncrop_side_hi": float(args.requery_attncrop_side_hi),
                 "attncrop_conc_floor": float(args.requery_attncrop_conc_floor),
+                "attncrop_cam_conc_floor": float(args.requery_attncrop_cam_conc_floor),
                 "overlay_dir": args.requery_attncrop_overlay_dir,
             })
             if args.requery_attncrop_overlay_dir:

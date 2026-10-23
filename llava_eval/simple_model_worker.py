@@ -382,7 +382,7 @@ class SimpleModelWorker:
                         # process_images(boxes_list=...)), then run the default_v2 checklist
                         # (H_A/H_B) on that crop. The attention map only PROPOSES the box;
                         # the final decision is still the VLM A/B sub-answers (never MuSc).
-                        from attn_crop import extract_attn_box_prepared
+                        from attn_crop import extract_attn_box_prepared, propose_box_margin_cam
 
                         ac_cl = str(requery.get("checklist", "default")).lower()
                         ac_checklist = get_hyp_checklist(subset, checklist=ac_cl)
@@ -401,24 +401,44 @@ class SimpleModelWorker:
                         box = None
                         if raw_images is not None and len(raw_images) == 1:
                             try:
-                                gen_tid = int(ab_ids[llm_letter][0])
-                                attn_meta = extract_attn_box_prepared(
-                                    model,
-                                    image_args["images"],
-                                    raw_images[0],
-                                    image_sizes,
-                                    image_args.get("roi_bboxes"),
-                                    input_ids,
-                                    gen_tid,
-                                    layers=str(requery.get("attncrop_layers", "midband")),
-                                    thr_q=float(requery.get("attncrop_thr_q", 0.90)),
-                                    expand=float(requery.get("attncrop_expand", 1.3)),
-                                    side_lo=float(requery.get("attncrop_side_lo", 0.06)),
-                                    side_hi=float(requery.get("attncrop_side_hi", 0.45)),
-                                    conc_floor=float(requery.get("attncrop_conc_floor", 0.30)),
-                                    overlay_path=overlay_path,
-                                    overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
-                                )
+                                proposer = str(requery.get("attncrop_proposer", "margin_cam")).lower()
+                                if proposer in ("margin_cam", "cam", "gradcam"):
+                                    attn_meta = propose_box_margin_cam(
+                                        model,
+                                        image_args["images"],
+                                        raw_images[0],
+                                        image_sizes,
+                                        image_args.get("roi_bboxes"),
+                                        input_ids,
+                                        ab_ids["A"],
+                                        ab_ids["B"],
+                                        thr_q=float(requery.get("attncrop_cam_thr_q", 0.60)),
+                                        expand=float(requery.get("attncrop_expand", 1.3)),
+                                        side_lo=float(requery.get("attncrop_side_lo", 0.06)),
+                                        side_hi=float(requery.get("attncrop_side_hi", 0.45)),
+                                        conc_floor=float(requery.get("attncrop_cam_conc_floor", 0.25)),
+                                        overlay_path=overlay_path,
+                                        overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
+                                    )
+                                else:
+                                    gen_tid = int(ab_ids[llm_letter][0])
+                                    attn_meta = extract_attn_box_prepared(
+                                        model,
+                                        image_args["images"],
+                                        raw_images[0],
+                                        image_sizes,
+                                        image_args.get("roi_bboxes"),
+                                        input_ids,
+                                        gen_tid,
+                                        layers=str(requery.get("attncrop_layers", "midband")),
+                                        thr_q=float(requery.get("attncrop_thr_q", 0.90)),
+                                        expand=float(requery.get("attncrop_expand", 1.3)),
+                                        side_lo=float(requery.get("attncrop_side_lo", 0.06)),
+                                        side_hi=float(requery.get("attncrop_side_hi", 0.45)),
+                                        conc_floor=float(requery.get("attncrop_conc_floor", 0.30)),
+                                        overlay_path=overlay_path,
+                                        overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
+                                    )
                             except Exception as e:
                                 attn_meta = {"kept": False, "reason": f"error:{e}", "box": None}
                         else:
@@ -488,6 +508,7 @@ class SimpleModelWorker:
 
                         hyp_v2_diag = {
                             "mode": "attncrop",
+                            "proposer": str(requery.get("attncrop_proposer", "margin_cam")).lower(),
                             "box": box,
                             "used_crop": box is not None,
                             "attn": attn_meta,

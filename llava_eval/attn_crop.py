@@ -554,6 +554,231 @@ def extract_attn_box_prepared(
 
 
 # ---------------------------------------------------------------------------
+# Margin-Grad-CAM proposer (decision-attribution saliency; no MuSc / no EG)
+# ---------------------------------------------------------------------------
+
+def _smooth_grid(g: np.ndarray, k: int = 3) -> np.ndarray:
+    """Edge-padded mean filter on a tiny grid (dependency-free)."""
+    a = np.asarray(g, dtype=np.float32)
+    if k <= 1 or a.size == 0:
+        return a
+    h, w = a.shape
+    pad = k // 2
+    p = np.pad(a, pad, mode="edge")
+    acc = np.zeros_like(a, dtype=np.float32)
+    for i in range(k):
+        for j in range(k):
+            acc += p[i:i + h, j:j + w]
+    return acc / float(k * k)
+
+
+def _logsumexp_group(logits_1d: torch.Tensor, ids: Sequence[int], device) -> Optional[torch.Tensor]:
+    idx = [int(i) for i in ids]
+    if not idx:
+        return None
+    t = torch.tensor(idx, device=device, dtype=torch.long)
+    return torch.logsumexp(logits_1d.index_select(0, t), dim=0)
+
+
+def propose_box_margin_cam(
+    model,
+    prepared_images,
+    image: Image.Image,
+    image_sizes: Sequence[Tuple[int, int]],
+    roi_bboxes,
+    input_ids: torch.Tensor,
+    ab_a_ids: Sequence[int],
+    ab_b_ids: Sequence[int],
+    *,
+    thr_q: float = 0.60,
+    expand: float = 1.30,
+    side_lo: float = 0.06,
+    side_hi: float = 0.45,
+    conc_floor: float = 0.25,
+    smooth_k: int = 3,
+    overlay_path: Optional[str] = None,
+    overlay_title: Optional[str] = None,
+    display_size: int = 640,
+) -> Dict[str, object]:
+    """Propose a suspect box from the FIRST-pass A/B decision via Grad-CAM.
+
+    Target = decision margin ``z_A - z_B`` at the last prompt position (whose
+    logits produce the first generated token). We backprop it to the packed
+    visual features (vision tower under ``no_grad``) and read a Grad-CAM map on
+    the **base** view, which maps linearly to the full image and therefore
+    avoids the anyres unpad/shrink geometry error.
+
+    Overlap with the first-pass EG boxes is allowed by design: the box is just
+    the peak of decision sensitivity. Purely model-derived -- no MuSc, no EG.
+    """
+    device = model.device
+    if not ab_a_ids or not ab_b_ids:
+        return {"kept": False, "box": None, "reason": "no_ab_ids", "proposer": "margin_cam"}
+
+    recorder = SegmentRecorder().install(model)
+    try:
+        # The worker runs under torch.inference_mode(); leave it so autograd works.
+        with torch.inference_mode(False):
+            prepared = prepared_images
+            if isinstance(prepared, list):
+                prepared = [t.to(device, dtype=model.dtype) for t in prepared]
+            else:
+                prepared = prepared.to(device, dtype=model.dtype)
+            with torch.no_grad():
+                (_, position_ids, attention_mask, _, prompt_embeds, _) = \
+                    model.prepare_inputs_labels_for_multimodal(
+                        input_ids, None, None, None, None,
+                        prepared, modalities=["image"],
+                        image_sizes=list(image_sizes), roi_bboxes=roi_bboxes,
+                    )
+            seg = recorder.last
+            if seg is None:
+                return {"kept": False, "box": None, "reason": "no_seg", "proposer": "margin_cam"}
+
+            n_packed = int(seg["n_global"]) + int(seg["n_roi"])
+            prompt_len = int(prompt_embeds.shape[1])
+            n_text = int(input_ids.shape[1]) - 1
+            n_visual = prompt_len - n_text
+            if n_visual < n_packed:
+                n_visual = n_packed
+            if n_visual <= 0 or n_visual > prompt_len:
+                return {"kept": False, "box": None, "reason": "bad_visual_len", "proposer": "margin_cam"}
+            trailing = n_visual - n_packed
+            vis_start, _ = find_visual_span(input_ids, n_visual)
+            vis_start = max(0, min(vis_start, prompt_len - n_visual))
+            vis_end = vis_start + n_visual
+
+            with torch.enable_grad():
+                img_feat = prompt_embeds[:, vis_start:vis_end].detach().clone().requires_grad_(True)
+                prefix = prompt_embeds[:, :vis_start]
+                suffix = prompt_embeds[:, vis_end:]
+                inputs_embeds = torch.cat([prefix, img_feat, suffix], dim=1)
+                seq_len = int(inputs_embeds.shape[1])
+                if position_ids is not None and int(position_ids.shape[1]) == seq_len:
+                    score_pos = position_ids
+                else:
+                    score_pos = torch.arange(seq_len, device=device).unsqueeze(0)
+                score_mask = torch.ones((1, seq_len), dtype=torch.long, device=device)
+
+                out = model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=score_mask,
+                    position_ids=score_pos,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                logits_last = out.logits[0, -1, :].float()
+                z_a = _logsumexp_group(logits_last, ab_a_ids, device)
+                z_b = _logsumexp_group(logits_last, ab_b_ids, device)
+                if z_a is None or z_b is None:
+                    del out
+                    return {"kept": False, "box": None, "reason": "no_ab_ids", "proposer": "margin_cam"}
+                margin = z_a - z_b
+                if not margin.requires_grad:
+                    del out
+                    return {"kept": False, "box": None, "reason": "no_graph", "proposer": "margin_cam"}
+                grad = torch.autograd.grad(margin, img_feat, retain_graph=False, create_graph=False)[0]
+                z_margin = float(margin.detach())
+                del out, inputs_embeds, prefix, suffix
+
+            # Grad-CAM over the packed visual tokens -> base-view grid
+            F_all = img_feat.detach()[0].float()      # (n_visual, H)
+            G_all = grad.detach()[0].float()          # (n_visual, H)
+            alpha = G_all.mean(dim=0)                 # (H,)
+            cam_tok = torch.relu((F_all * alpha).sum(dim=-1))
+            if float(cam_tok.max()) <= 0:
+                cam_tok = torch.relu((F_all * G_all).sum(dim=-1))
+            if float(cam_tok.max()) <= 0:
+                cam_tok = G_all.abs().sum(dim=-1)
+            cam_full = cam_tok.detach().cpu().numpy().astype(np.float32)  # (n_visual,)
+
+            # geometry / views (base maps linearly to the full image)
+            vt = model.get_vision_tower()
+            patch_size = int(getattr(vt, "patch_size", 14) or 14)
+            vis_size = int(getattr(vt, "image_size", 384) or 384)
+            pps = int(getattr(vt, "num_patches_per_side", 27) or 27)
+            pinpoints = getattr(model.config, "image_grid_pinpoints", None)
+            max_patches = 9
+            iar = str(getattr(model.config, "image_aspect_ratio", "") or "")
+            m = re.search(r"anyres_max_(\d+)", iar)
+            if m:
+                max_patches = int(m.group(1))
+            any_hw = None
+            if seg["n_anyres"] > 0:
+                computed = llava_anyres_spatial_hw(
+                    image.size, pinpoints, vis_size, pps,
+                    max_num_patches=max_patches, n_anyres=seg["n_anyres"],
+                )
+                if computed is not None:
+                    any_hw = (computed[0], computed[1])
+            bboxes = seg.get("bboxes") or []
+            if not bboxes and roi_bboxes and roi_bboxes[0]:
+                bboxes = roi_bboxes[0]
+            views = build_views(
+                image_size_wh=image.size,
+                n_base=int(seg["n_base"]),
+                n_anyres=int(seg["n_anyres"]),
+                roi_lens=seg.get("roi_lens") or [],
+                roi_spatial_shape=seg.get("roi_spatial_shape"),
+                bboxes=bboxes,
+                anyres_hw=any_hw,
+                patch_size=patch_size,
+                vis_start=vis_start,
+            )
+            base_view = next((v for v in views if v["name"] == "base"), None)
+            if base_view is None:
+                return {"kept": False, "box": None, "reason": "no_base", "proposer": "margin_cam"}
+
+            grid = view_raw_spatial_grid(base_view, cam_full).astype(np.float32)
+            if grid.size <= 1 or float(grid.max()) <= 0:
+                return {"kept": False, "box": None, "reason": "cam_empty", "proposer": "margin_cam"}
+            grid = _smooth_grid(grid, smooth_k)
+            if float(grid.max()) <= 0:
+                return {"kept": False, "box": None, "reason": "cam_empty", "proposer": "margin_cam"}
+
+            res = grid_to_box(
+                grid,
+                base_view["source_box_xyxy"],
+                image.size,
+                thr_q=thr_q, expand=expand, side_lo=side_lo, side_hi=side_hi, conc_floor=conc_floor,
+            )
+            res["proposer"] = "margin_cam"
+            res["z_margin"] = z_margin
+            res["cam"] = {
+                "view": "base",
+                "grid_wh": [int(grid.shape[0]), int(grid.shape[1])],
+                "cam_max": round(float(grid.max()), 6),
+                "top5_mass": res.get("top5_mass"),
+                "grad_norm": round(float(G_all.norm()), 6),
+                "n_visual": int(n_visual),
+                "trailing": int(trailing),
+                "smooth_k": int(smooth_k),
+            }
+            res["config"] = {
+                "proposer": "margin_cam", "thr_q": thr_q, "expand": expand,
+                "side_lo": side_lo, "side_hi": side_hi, "conc_floor": conc_floor,
+            }
+            if isinstance(res.get("box"), (list, tuple)):
+                res["box"] = [round(float(v), 2) for v in res["box"]]
+
+            if overlay_path:
+                try:
+                    save_attn_box_overlay(
+                        overlay_path, image, base_view, cam_full,
+                        res.get("box"), title=overlay_title, display_size=display_size,
+                        map_name="cam",
+                    )
+                    res["overlay"] = overlay_path
+                except Exception as e:  # visualization must never break eval
+                    res["overlay_error"] = repr(e)
+            return res
+    finally:
+        recorder.uninstall()
+
+
+# ---------------------------------------------------------------------------
 # Visualization: attention heat overlay + crop box on the original image
 # ---------------------------------------------------------------------------
 
@@ -574,11 +799,14 @@ def save_attn_box_overlay(
     *,
     title: Optional[str] = None,
     display_size: int = 640,
+    map_name: str = "attn",
 ) -> str:
-    """3-panel figure: original(+box) | attention overlay(+box) | crop.
+    """3-panel figure: original(+box) | heatmap overlay(+box) | crop.
 
-    The attention grid of ``view`` (usually ``anyres``) is upsampled to the full
-    image and blended with the original; the crop box is drawn in red.
+    The heat grid of ``view`` (``anyres`` for attention, ``base`` for the
+    margin-Grad-CAM proposer) is upsampled to the full image and blended with
+    the original; the crop box is drawn in red. ``map_name`` labels the heat
+    panel (``attn`` by default, ``cam`` for the Grad-CAM proposer).
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     grid = _normalize01(view_raw_spatial_grid(view, visual_scores))  # (H, W)
@@ -608,7 +836,7 @@ def save_attn_box_overlay(
 
     orig_panel = _with_box(img)
     ov_panel = _with_box(overlay_img)
-    panels = [("original", orig_panel), ("attn", ov_panel)]
+    panels = [("original", orig_panel), (str(map_name or "attn"), ov_panel)]
     if crop_img is not None:
         panels.append(("crop", crop_img))
 
