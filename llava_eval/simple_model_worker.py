@@ -177,10 +177,213 @@ class SimpleModelWorker:
         #   aggregate S_A/S_B; NEVER musc_scores. Fallback to llm_letter.
         ab_tau = params.get("ab_tau", None)
         requery = params.get("requery", None)
+        real_mode = (
+            requery is not None
+            and str(requery.get("mode", "")).lower() == "real"
+        )
         use_ab_score = (
             (ab_tau is not None and float(ab_tau) >= 0)
-            or (requery is not None)
+            or (requery is not None and not real_mode)
         )
+
+        # ------------------------------------------------------------------
+        # ReAL mode (cotm_v3 reasoning + attention-crop requery).
+        # Long generation first; harvest reasoning-token attention to crop a
+        # suspect ROI; re-ask H_A/H_B on the crop; flip <answer> only if the
+        # crop vote disagrees with the original answer (vote-flip logic).
+        # ------------------------------------------------------------------
+        if real_mode:
+            from attn_crop import propose_box_real
+
+            tmpl = params.get("conv_template", "qwen_1_5")
+            if tmpl not in conv_templates:
+                tmpl = "qwen_1_5"
+            use_im_se = getattr(model.config, "mm_use_im_start_end", False)
+
+            # 1) normal long generation (FlashAttention path untouched)
+            gen_kwargs = {
+                "do_sample": do_sample,
+                "max_new_tokens": max_new_tokens,
+                "use_cache": True,
+            }
+            if do_sample:
+                gen_kwargs["temperature"] = temperature
+                gen_kwargs["top_p"] = top_p
+            out = model.generate(inputs=input_ids, **image_args, **gen_kwargs)
+            in_len = int(input_ids.shape[1])
+            if (
+                out.shape[1] >= in_len
+                and torch.equal(out[0, :in_len].detach().cpu(), input_ids[0].detach().cpu())
+            ):
+                gen_ids = out[:, in_len:]
+            else:
+                gen_ids = out
+            gen_token_list = gen_ids[0].tolist()
+            full_text = "".join(tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
+
+            # 2) parse original answer (Yes/No) from cotm_v3 output
+            import re as _re
+            ans_m = _re.search(r"<answer>\s*(Yes|No)\s*</answer>", full_text, _re.I)
+            orig_yes = None
+            if ans_m:
+                orig_yes = 1 if ans_m.group(1).lower() == "yes" else 0
+
+            # 3) ReAL crop box from reasoning-token attention
+            overlay_dir = requery.get("overlay_dir")
+            overlay_path = None
+            if overlay_dir:
+                safe_id = _re.sub(r"[^\w.\-]+", "_", str(params.get("sample_id") or "sample"))[:100]
+                safe_sub = _re.sub(r"[^\w.\-]+", "_", str(params.get("subset") or "sub"))[:40]
+                overlay_path = os.path.join(overlay_dir, f"{safe_sub}__{safe_id}.png")
+
+            real_meta = None
+            box = None
+            if raw_images is not None and len(raw_images) == 1 and gen_token_list:
+                try:
+                    real_meta = propose_box_real(
+                        model,
+                        tokenizer,
+                        image_args["images"],
+                        raw_images[0],
+                        image_sizes,
+                        image_args.get("roi_bboxes"),
+                        input_ids,
+                        gen_token_list,
+                        layers=str(requery.get("attncrop_layers", "midband")),
+                        keep_frac=float(requery.get("real_keep_frac", 0.5)),
+                        alpha=float(requery.get("real_alpha", 0.6)),
+                        beta=float(requery.get("real_beta", 0.4)),
+                        tau_t=float(requery.get("real_tau_t", 0.0)),
+                        tau_i=float(requery.get("real_tau_i", 0.0)),
+                        view_name=str(requery.get("real_view", "anyres")),
+                        thr_q=float(requery.get("attncrop_thr_q", 0.70)),
+                        expand=float(requery.get("attncrop_expand", 1.3)),
+                        side_lo=float(requery.get("attncrop_side_lo", 0.06)),
+                        side_hi=float(requery.get("attncrop_side_hi", 0.45)),
+                        conc_floor=float(requery.get("attncrop_conc_floor", 0.20)),
+                        overlay_path=overlay_path,
+                        overlay_title=f"{params.get('sample_id')} | {params.get('subset')} | real",
+                    )
+                except Exception as e:
+                    real_meta = {"kept": False, "reason": f"error:{e}", "box": None}
+            else:
+                real_meta = {"kept": False, "reason": "multi_image_or_empty_gen", "box": None}
+
+            if real_meta and real_meta.get("kept"):
+                box = real_meta.get("box")
+
+            # 4) crop + H_A/H_B vote-flip on the crop
+            final_yes = orig_yes
+            decision_src = "real_no_crop"
+            sub_records = []
+            S_A = 0.0
+            S_B = 0.0
+            if box is not None and orig_yes is not None:
+                if self._ab_token_ids is None:
+                    self._ab_token_ids = resolve_ab_token_ids(tokenizer)
+                ab_ids = self._ab_token_ids
+                if ab_ids.get("A") and ab_ids.get("B"):
+                    def _build_sub_prompt(question_text):
+                        body = DEFAULT_IMAGE_TOKEN + "\n" + format_subq(question_text)
+                        if use_im_se:
+                            body = body.replace(
+                                DEFAULT_IMAGE_TOKEN,
+                                DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN,
+                            )
+                        conv = conv_templates[tmpl].copy()
+                        conv.append_message(conv.roles[0], body)
+                        conv.append_message(conv.roles[1], None)
+                        return conv.get_prompt()
+
+                    def _ab_forward_local(prompt_str, ia):
+                        ids = tokenizer_image_token(
+                            prompt_str, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+                        ).unsqueeze(0).to(self.device)
+                        g = model.generate(
+                            inputs=ids, do_sample=False, max_new_tokens=1, use_cache=True,
+                            output_scores=True, return_dict_in_generate=True, **ia,
+                        )
+                        lg = g.scores[0][0].float()
+                        z_a = float(max(lg[i].item() for i in ab_ids["A"]))
+                        z_b = float(max(lg[i].item() for i in ab_ids["B"]))
+                        p_a, p_b = two_way_softmax(z_a, z_b)
+                        return p_a, p_b
+
+                    ac_cl = str(requery.get("checklist", "default")).lower()
+                    ac_checklist = get_hyp_checklist(params.get("subset") or "", checklist=ac_cl)
+                    ac_max_subq = int(requery.get("max_subq", 3))
+                    ha_qs = list(ac_checklist.get("H_A") or [])[: max(0, ac_max_subq)]
+                    hb_qs = list(ac_checklist.get("H_B") or [])[: max(0, ac_max_subq)]
+                    tau_ev = float(requery.get("tau_ev", 0.7))
+                    delta = float(requery.get("delta", 1.0))
+
+                    crop_images, crop_roi = process_images(
+                        raw_images, image_processor, model.config,
+                        masks=raw_masks, boxes_list=[[box]], return_bboxes=True,
+                    )
+                    if isinstance(crop_images, list):
+                        crop_images = [im.to(model.device, dtype=model.dtype) for im in crop_images]
+                    else:
+                        crop_images = crop_images.to(model.device, dtype=model.dtype)
+                    ia_crop = {"images": crop_images, "image_sizes": image_sizes, "roi_bboxes": crop_roi}
+
+                    for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
+                        for q in qlist:
+                            sp_a, sp_b = _ab_forward_local(_build_sub_prompt(q), ia_crop)
+                            conf = max(sp_a, sp_b)
+                            ans_letter = "A" if sp_a >= 0.5 else "B"
+                            sub_records.append({
+                                "hyp": hyp_tag, "q": q, "p_A": sp_a, "p_B": sp_b,
+                                "letter": ans_letter, "conf": conf, "kept": conf >= tau_ev,
+                                "view": "real_crop",
+                            })
+                    for rec in sub_records:
+                        if not rec.get("kept"):
+                            continue
+                        if rec["hyp"] == "H_A":
+                            if rec["letter"] == "A":
+                                S_A += 1.0
+                            else:
+                                S_B += 1.0
+                        else:
+                            if rec["letter"] == "A":
+                                S_B += 1.0
+                            else:
+                                S_A += 1.0
+                    if S_A - S_B >= delta:
+                        final_yes, decision_src = 1, "real_crop_vote"
+                    elif S_B - S_A >= delta:
+                        final_yes, decision_src = 0, "real_crop_vote"
+                    else:
+                        final_yes, decision_src = orig_yes, "real_crop_agree"
+                else:
+                    decision_src = "real_crop_no_ab_ids"
+
+            # 5) rewrite <answer> if a flip happened
+            if final_yes is not None and orig_yes is not None and final_yes != orig_yes:
+                new_tag = "Yes" if final_yes == 1 else "No"
+                full_text = _re.sub(
+                    r"<answer>\s*(?:Yes|No)\s*</answer>",
+                    f"<answer>{new_tag}</answer>",
+                    full_text, count=1, flags=_re.I,
+                )
+
+            self.last_ab_decision = {
+                "mode": "real",
+                "box": box,
+                "used_crop": box is not None,
+                "orig_yes": orig_yes,
+                "final_yes": final_yes,
+                "decision_src": decision_src,
+                "S_A": S_A,
+                "S_B": S_B,
+                "flipped": (orig_yes is not None and final_yes is not None and final_yes != orig_yes),
+                "sub_answers": sub_records,
+                "real": real_meta,
+                "requery": dict(requery),
+            }
+            return full_text
+
         if use_ab_score:
             if self._ab_token_ids is None:
                 self._ab_token_ids = resolve_ab_token_ids(tokenizer)
@@ -382,7 +585,7 @@ class SimpleModelWorker:
                         # process_images(boxes_list=...)), then run the default_v2 checklist
                         # (H_A/H_B) on that crop. The attention map only PROPOSES the box;
                         # the final decision is still the VLM A/B sub-answers (never MuSc).
-                        from attn_crop import extract_attn_box_prepared, propose_box_margin_cam
+                        from attn_crop import extract_attn_box_prepared
 
                         ac_cl = str(requery.get("checklist", "default")).lower()
                         ac_checklist = get_hyp_checklist(subset, checklist=ac_cl)
@@ -401,44 +604,24 @@ class SimpleModelWorker:
                         box = None
                         if raw_images is not None and len(raw_images) == 1:
                             try:
-                                proposer = str(requery.get("attncrop_proposer", "margin_cam")).lower()
-                                if proposer in ("margin_cam", "cam", "gradcam"):
-                                    attn_meta = propose_box_margin_cam(
-                                        model,
-                                        image_args["images"],
-                                        raw_images[0],
-                                        image_sizes,
-                                        image_args.get("roi_bboxes"),
-                                        input_ids,
-                                        ab_ids["A"],
-                                        ab_ids["B"],
-                                        thr_q=float(requery.get("attncrop_cam_thr_q", 0.60)),
-                                        expand=float(requery.get("attncrop_expand", 1.3)),
-                                        side_lo=float(requery.get("attncrop_side_lo", 0.06)),
-                                        side_hi=float(requery.get("attncrop_side_hi", 0.45)),
-                                        conc_floor=float(requery.get("attncrop_cam_conc_floor", 0.25)),
-                                        overlay_path=overlay_path,
-                                        overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
-                                    )
-                                else:
-                                    gen_tid = int(ab_ids[llm_letter][0])
-                                    attn_meta = extract_attn_box_prepared(
-                                        model,
-                                        image_args["images"],
-                                        raw_images[0],
-                                        image_sizes,
-                                        image_args.get("roi_bboxes"),
-                                        input_ids,
-                                        gen_tid,
-                                        layers=str(requery.get("attncrop_layers", "midband")),
-                                        thr_q=float(requery.get("attncrop_thr_q", 0.90)),
-                                        expand=float(requery.get("attncrop_expand", 1.3)),
-                                        side_lo=float(requery.get("attncrop_side_lo", 0.06)),
-                                        side_hi=float(requery.get("attncrop_side_hi", 0.45)),
-                                        conc_floor=float(requery.get("attncrop_conc_floor", 0.30)),
-                                        overlay_path=overlay_path,
-                                        overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
-                                    )
+                                gen_tid = int(ab_ids[llm_letter][0])
+                                attn_meta = extract_attn_box_prepared(
+                                    model,
+                                    image_args["images"],
+                                    raw_images[0],
+                                    image_sizes,
+                                    image_args.get("roi_bboxes"),
+                                    input_ids,
+                                    gen_tid,
+                                    layers=str(requery.get("attncrop_layers", "midband")),
+                                    thr_q=float(requery.get("attncrop_thr_q", 0.90)),
+                                    expand=float(requery.get("attncrop_expand", 1.3)),
+                                    side_lo=float(requery.get("attncrop_side_lo", 0.06)),
+                                    side_hi=float(requery.get("attncrop_side_hi", 0.45)),
+                                    conc_floor=float(requery.get("attncrop_conc_floor", 0.30)),
+                                    overlay_path=overlay_path,
+                                    overlay_title=f"{params.get('sample_id')} | {subset} | pA={p_a:.3f}",
+                                )
                             except Exception as e:
                                 attn_meta = {"kept": False, "reason": f"error:{e}", "box": None}
                         else:
@@ -508,7 +691,6 @@ class SimpleModelWorker:
 
                         hyp_v2_diag = {
                             "mode": "attncrop",
-                            "proposer": str(requery.get("attncrop_proposer", "margin_cam")).lower(),
                             "box": box,
                             "used_crop": box is not None,
                             "attn": attn_meta,

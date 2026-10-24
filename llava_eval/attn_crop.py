@@ -177,6 +177,109 @@ def score_layers(
 
 
 # ---------------------------------------------------------------------------
+# Multi-query read-only Q/K attention (ReAL: score MANY reasoning tokens at once)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _independent_qk_attention_multi(
+    decoder_layer,
+    hidden_states: torch.Tensor,
+    position_embeddings,
+    attention_mask: Optional[torch.Tensor],
+    query_indices: Sequence[int],
+) -> torch.Tensor:
+    """Full attention rows for a batch of query positions, one layer.
+
+    Returns ``[n_query, L]`` softmax rows (head-averaged). Keys are projected
+    ONCE and shared across all queries (cheap: one forward, N query rows).
+    """
+    if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+        raise ValueError("independent scoring expects batch size 1 [1, L, H]")
+    batch, length, _ = hidden_states.shape
+    device = hidden_states.device
+    positions = torch.arange(length, device=device).expand(batch, -1)
+    valid = torch.ones((batch, length), dtype=torch.bool, device=device)
+    if attention_mask is not None:
+        if attention_mask.ndim != 2 or attention_mask.shape != (batch, length):
+            raise ValueError("scoring requires a 2D padding mask [B, L]")
+        valid = attention_mask.to(device=device, dtype=torch.bool)
+    rows = torch.arange(batch, device=device)
+    q_idx = torch.tensor([int(q) for q in query_indices], device=device, dtype=torch.long)
+    if (q_idx < 0).any() or (q_idx >= length).any() or (~valid[0, q_idx]).any():
+        raise ValueError(f"invalid query_indices for length={length}")
+
+    attention = decoder_layer.self_attn
+    normalized = decoder_layer.input_layernorm(hidden_states)
+    query = attention.q_proj(normalized[0, q_idx]).unsqueeze(0)  # [1, Nq, H]
+    key = attention.k_proj(normalized)                           # [1, L, H]
+    query = query.view(1, q_idx.numel(), attention.num_heads, attention.head_dim).transpose(1, 2)
+    key = key.view(1, length, attention.num_key_value_heads, attention.head_dim).transpose(1, 2)
+
+    cos, sin = (item.to(device=device).expand(batch, -1, -1) for item in position_embeddings)
+    if cos.shape[-1] * 2 == query.shape[-1]:
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
+    query_cos = cos[0, q_idx][None, None, :, :]   # [1,1,Nq,D]
+    query_sin = sin[0, q_idx][None, None, :, :]
+    query = query * query_cos + _rotate_half(query) * query_sin
+    key = key * cos[:, None] + _rotate_half(key) * sin[:, None]
+    groups = getattr(attention, "num_key_value_groups", None)
+    if groups is None:
+        groups = attention.num_heads // max(attention.num_key_value_heads, 1)
+    key = key.repeat_interleave(groups, dim=1)
+
+    logits = torch.matmul(query.float(), key.float().transpose(-2, -1))  # [1, H, Nq, L]
+    logits = logits.squeeze(0) / math.sqrt(attention.head_dim)           # [H, Nq, L]
+    # causal: query at position q_idx[i] can only see keys <= q_idx[i]
+    visible = positions[0][None, :] <= q_idx[:, None]                     # [Nq, L]
+    visible = visible[None, :, :] & valid[0][None, None, :]              # [1(H), Nq, L]
+    finite = logits.masked_select(visible)
+    if finite.numel() and not torch.isfinite(finite).all():
+        raise FloatingPointError("Non-finite independent Q/K scores")
+    logits = logits.masked_fill(~visible, float("-inf"))
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float32).mean(dim=0)  # [Nq, L]
+    return probs
+
+
+@torch.no_grad()
+def score_layers_multi(
+    model,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    layer_indices: Sequence[int],
+    query_indices: Sequence[int],
+) -> Dict[int, np.ndarray]:
+    """One forward, then per layer the full attention rows of many queries.
+
+    Returns ``{layer: ndarray[n_query, L]}``.
+    """
+    outputs = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        output_hidden_states=True,
+        output_attentions=False,
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden_states = outputs.hidden_states
+    pos_emb = _position_embeddings(model, hidden_states[0], position_ids)
+    out: Dict[int, np.ndarray] = {}
+    for li in layer_indices:
+        rows = _independent_qk_attention_multi(
+            model.model.layers[li],
+            hidden_states[li],
+            pos_emb,
+            attention_mask=attention_mask,
+            query_indices=query_indices,
+        )
+        out[int(li)] = rows.detach().float().cpu().numpy()
+    del outputs
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Segment recorder (BASE / ANYRES / ROI lengths from Triad merge)
 # ---------------------------------------------------------------------------
 
@@ -554,226 +657,348 @@ def extract_attn_box_prepared(
 
 
 # ---------------------------------------------------------------------------
-# Margin-Grad-CAM proposer (decision-attribution saliency; no MuSc / no EG)
+# ReAL proposer: harvest reasoning-token attention, filter by S_T + S_I
+# (Reasoning-Driven Anomaly Detection, CVPR'26) -> aggregate RDAM -> crop box
 # ---------------------------------------------------------------------------
 
-def _smooth_grid(g: np.ndarray, k: int = 3) -> np.ndarray:
-    """Edge-padded mean filter on a tiny grid (dependency-free)."""
-    a = np.asarray(g, dtype=np.float32)
-    if k <= 1 or a.size == 0:
-        return a
-    h, w = a.shape
-    pad = k // 2
-    p = np.pad(a, pad, mode="edge")
-    acc = np.zeros_like(a, dtype=np.float32)
-    for i in range(k):
-        for j in range(k):
-            acc += p[i:i + h, j:j + w]
-    return acc / float(k * k)
+def _spatial_entropy(grid: np.ndarray) -> float:
+    """Normalized spatial entropy in [0,1]; low = concentrated."""
+    g = np.maximum(np.asarray(grid, dtype=np.float64).reshape(-1), 0.0)
+    total = float(g.sum())
+    if g.size <= 1 or total <= 0:
+        return 1.0
+    p = g / total
+    ent = float(-(p * np.log(np.maximum(p, 1e-12))).sum())
+    return float(ent / math.log(g.size))
 
 
-def _logsumexp_group(logits_1d: torch.Tensor, ids: Sequence[int], device) -> Optional[torch.Tensor]:
-    idx = [int(i) for i in ids]
+def _concentration_score(grid: np.ndarray, topk_frac: float = 0.10) -> float:
+    """ReAL ``S_I``: spatial concentration in [0,1] (1 - entropy + top-k mass blend)."""
+    g = np.maximum(np.asarray(grid, dtype=np.float64), 0.0)
+    flat = g.reshape(-1)
+    total = float(flat.sum())
+    if flat.size <= 1 or total <= 0:
+        return 0.0
+    ent = _spatial_entropy(g)
+    k = max(1, int(math.ceil(topk_frac * flat.size)))
+    topk = float(np.sort(flat / total)[-k:].sum())
+    # both terms in [0,1]; combine so a single hot blob scores high
+    return float(0.5 * (1.0 - ent) + 0.5 * topk)
+
+
+def _semantic_relevance(row: np.ndarray, anchor_idx: Sequence[int]) -> float:
+    """ReAL ``S_T``: attention mass a query puts on anomaly-anchor text tokens."""
+    if not anchor_idx:
+        return 0.0
+    idx = [int(i) for i in anchor_idx if 0 <= int(i) < row.shape[-1]]
     if not idx:
-        return None
-    t = torch.tensor(idx, device=device, dtype=torch.long)
-    return torch.logsumexp(logits_1d.index_select(0, t), dim=0)
+        return 0.0
+    return float(np.asarray(row)[idx].sum())
 
 
-def propose_box_margin_cam(
+def _find_anchor_positions(tokenizer, input_ids_list: Sequence[int], anchor_words: Sequence[str],
+                           image_token_index: int = -200) -> List[int]:
+    """Best-effort locate anomaly-anchor tokens within the packed ``input_ids``.
+
+    We map each of the original text tokens (id != IMAGE_TOKEN) to a string and
+    keep the positions whose decoded piece contains one of ``anchor_words``
+    (case-insensitive). Returns positions in ``input_ids`` coordinates; the
+    caller must shift by the number of inserted visual tokens to get the
+    prompt-embedding coordinates.
+    """
+    anchors = [w.lower() for w in anchor_words if w]
+    hits: List[int] = []
+    if not anchors:
+        return hits
+    for pos, tid in enumerate(input_ids_list):
+        tid = int(tid)
+        if tid == int(image_token_index):
+            continue
+        try:
+            piece = tokenizer.decode([tid]).lower()
+        except Exception:
+            continue
+        if any(w in piece for w in anchors):
+            hits.append(pos)
+    return hits
+
+
+def _shift_positions_to_prompt(anchor_input_positions: Sequence[int],
+                               input_ids_list: Sequence[int],
+                               n_visual: int,
+                               image_token_index: int = -200) -> List[int]:
+    """Convert input_ids positions -> prompt-embedding positions (visual tokens inserted)."""
+    # Visual tokens replace the single IMAGE token; net insertion = n_visual - 1.
+    ids = [int(t) for t in input_ids_list]
+    try:
+        img_pos = ids.index(int(image_token_index))
+    except ValueError:
+        return list(anchor_input_positions)
+    shift = n_visual - 1
+    out = []
+    for p in anchor_input_positions:
+        if p <= img_pos:
+            out.append(p)
+        else:
+            out.append(p + shift)
+    return out
+
+
+def propose_box_real(
     model,
+    tokenizer,
     prepared_images,
     image: Image.Image,
     image_sizes: Sequence[Tuple[int, int]],
     roi_bboxes,
     input_ids: torch.Tensor,
-    ab_a_ids: Sequence[int],
-    ab_b_ids: Sequence[int],
+    reasoning_token_ids: Sequence[int],
     *,
-    thr_q: float = 0.60,
-    expand: float = 1.30,
+    layers: str = "midband",
+    anchor_words: Optional[Sequence[str]] = None,
+    tau_t: float = 0.0,
+    tau_i: float = 0.0,
+    keep_frac: float = 0.5,
+    alpha: float = 0.6,
+    beta: float = 0.4,
+    view_name: str = "anyres",
+    thr_q: float = 0.70,
+    expand: float = 1.3,
     side_lo: float = 0.06,
     side_hi: float = 0.45,
-    conc_floor: float = 0.25,
-    smooth_k: int = 3,
+    conc_floor: float = 0.20,
     overlay_path: Optional[str] = None,
     overlay_title: Optional[str] = None,
     display_size: int = 640,
 ) -> Dict[str, object]:
-    """Propose a suspect box from the FIRST-pass A/B decision via Grad-CAM.
+    """ReAL-style suspect box from harvested reasoning-token attention.
 
-    Target = decision margin ``z_A - z_B`` at the last prompt position (whose
-    logits produce the first generated token). We backprop it to the packed
-    visual features (vision tower under ``no_grad``) and read a Grad-CAM map on
-    the **base** view, which maps linearly to the full image and therefore
-    avoids the anyres unpad/shrink geometry error.
-
-    Overlap with the first-pass EG boxes is allowed by design: the box is just
-    the peak of decision sensitivity. Purely model-derived -- no MuSc, no EG.
+    Steps (mirrors the CVPR'26 ReAL module, adapted to frozen Triad):
+      * take the model-generated reasoning token ids as the query pool;
+      * for every reasoning token compute
+          - ``S_T`` = attention mass on anomaly-anchor text tokens (semantic);
+          - ``S_I`` = spatial concentration of its visual attention (1-entropy);
+      * keep the few tokens passing ``S_T``/``S_I`` relative thresholds,
+        weighted by ``w = alpha*S_T_hat + beta*S_I_hat``;
+      * weighted-aggregate their visual attention maps -> RDAM spatial grid ->
+        largest-mass blob -> square crop box (same geometry as ``attn`` proposer).
     """
     device = model.device
-    if not ab_a_ids or not ab_b_ids:
-        return {"kept": False, "box": None, "reason": "no_ab_ids", "proposer": "margin_cam"}
+    if not reasoning_token_ids:
+        return {"kept": False, "box": None, "reason": "no_reasoning_tokens", "proposer": "real"}
+    n_layers = len(model.model.layers)
+    layer_indices = resolve_attn_layers(layers, n_layers)
+    anchor_words = list(anchor_words) if anchor_words else [
+        "defect", "fault", "anomal", "abnormal", "peculiar", "damage", "flaw",
+    ]
 
     recorder = SegmentRecorder().install(model)
     try:
-        # The worker runs under torch.inference_mode(); leave it so autograd works.
-        with torch.inference_mode(False):
-            prepared = prepared_images
-            if isinstance(prepared, list):
-                prepared = [t.to(device, dtype=model.dtype) for t in prepared]
-            else:
-                prepared = prepared.to(device, dtype=model.dtype)
-            with torch.no_grad():
-                (_, position_ids, attention_mask, _, prompt_embeds, _) = \
-                    model.prepare_inputs_labels_for_multimodal(
-                        input_ids, None, None, None, None,
-                        prepared, modalities=["image"],
-                        image_sizes=list(image_sizes), roi_bboxes=roi_bboxes,
-                    )
-            seg = recorder.last
-            if seg is None:
-                return {"kept": False, "box": None, "reason": "no_seg", "proposer": "margin_cam"}
+        prepared = prepared_images
+        if isinstance(prepared, list):
+            prepared = [t.to(device, dtype=model.dtype) for t in prepared]
+        else:
+            prepared = prepared.to(device, dtype=model.dtype)
 
-            n_packed = int(seg["n_global"]) + int(seg["n_roi"])
-            prompt_len = int(prompt_embeds.shape[1])
-            n_text = int(input_ids.shape[1]) - 1
-            n_visual = prompt_len - n_text
-            if n_visual < n_packed:
-                n_visual = n_packed
-            if n_visual <= 0 or n_visual > prompt_len:
-                return {"kept": False, "box": None, "reason": "bad_visual_len", "proposer": "margin_cam"}
-            trailing = n_visual - n_packed
-            vis_start, _ = find_visual_span(input_ids, n_visual)
-            vis_start = max(0, min(vis_start, prompt_len - n_visual))
-            vis_end = vis_start + n_visual
-
-            with torch.enable_grad():
-                img_feat = prompt_embeds[:, vis_start:vis_end].detach().clone().requires_grad_(True)
-                prefix = prompt_embeds[:, :vis_start]
-                suffix = prompt_embeds[:, vis_end:]
-                inputs_embeds = torch.cat([prefix, img_feat, suffix], dim=1)
-                seq_len = int(inputs_embeds.shape[1])
-                if position_ids is not None and int(position_ids.shape[1]) == seq_len:
-                    score_pos = position_ids
-                else:
-                    score_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-                score_mask = torch.ones((1, seq_len), dtype=torch.long, device=device)
-
-                out = model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=score_mask,
-                    position_ids=score_pos,
-                    output_hidden_states=False,
-                    output_attentions=False,
-                    use_cache=False,
-                    return_dict=True,
+        with torch.no_grad():
+            (_, position_ids, attention_mask, _, prompt_embeds, _) = \
+                model.prepare_inputs_labels_for_multimodal(
+                    input_ids, None, None, None, None,
+                    prepared, modalities=["image"],
+                    image_sizes=list(image_sizes), roi_bboxes=roi_bboxes,
                 )
-                logits_last = out.logits[0, -1, :].float()
-                z_a = _logsumexp_group(logits_last, ab_a_ids, device)
-                z_b = _logsumexp_group(logits_last, ab_b_ids, device)
-                if z_a is None or z_b is None:
-                    del out
-                    return {"kept": False, "box": None, "reason": "no_ab_ids", "proposer": "margin_cam"}
-                margin = z_a - z_b
-                if not margin.requires_grad:
-                    del out
-                    return {"kept": False, "box": None, "reason": "no_graph", "proposer": "margin_cam"}
-                grad = torch.autograd.grad(margin, img_feat, retain_graph=False, create_graph=False)[0]
-                z_margin = float(margin.detach())
-                del out, inputs_embeds, prefix, suffix
+        seg = recorder.last
+        if seg is None:
+            return {"kept": False, "box": None, "reason": "no_seg", "proposer": "real"}
 
-            # Grad-CAM over the packed visual tokens -> base-view grid
-            F_all = img_feat.detach()[0].float()      # (n_visual, H)
-            G_all = grad.detach()[0].float()          # (n_visual, H)
-            alpha = G_all.mean(dim=0)                 # (H,)
-            cam_tok = torch.relu((F_all * alpha).sum(dim=-1))
-            if float(cam_tok.max()) <= 0:
-                cam_tok = torch.relu((F_all * G_all).sum(dim=-1))
-            if float(cam_tok.max()) <= 0:
-                cam_tok = G_all.abs().sum(dim=-1)
-            cam_full = cam_tok.detach().cpu().numpy().astype(np.float32)  # (n_visual,)
+        n_packed = int(seg["n_global"]) + int(seg["n_roi"])
+        prompt_len = int(prompt_embeds.shape[1])
+        n_text = int(input_ids.shape[1]) - 1
+        n_visual = prompt_len - n_text
+        if n_visual < n_packed:
+            n_visual = n_packed
+        trailing = n_visual - n_packed
+        vis_start, _ = find_visual_span(input_ids, n_visual)
+        vis_end = vis_start + n_visual
 
-            # geometry / views (base maps linearly to the full image)
-            vt = model.get_vision_tower()
-            patch_size = int(getattr(vt, "patch_size", 14) or 14)
-            vis_size = int(getattr(vt, "image_size", 384) or 384)
-            pps = int(getattr(vt, "num_patches_per_side", 27) or 27)
-            pinpoints = getattr(model.config, "image_grid_pinpoints", None)
-            max_patches = 9
-            iar = str(getattr(model.config, "image_aspect_ratio", "") or "")
-            m = re.search(r"anyres_max_(\d+)", iar)
-            if m:
-                max_patches = int(m.group(1))
-            any_hw = None
-            if seg["n_anyres"] > 0:
-                computed = llava_anyres_spatial_hw(
-                    image.size, pinpoints, vis_size, pps,
-                    max_num_patches=max_patches, n_anyres=seg["n_anyres"],
+        # scoring sequence = prompt + reasoning tokens
+        r_ids = [int(t) for t in reasoning_token_ids]
+        gen_emb = model.get_model().embed_tokens(
+            torch.tensor([r_ids], device=device, dtype=torch.long)
+        ).to(prompt_embeds.dtype)
+        score_embeds = torch.cat([prompt_embeds, gen_emb], dim=1)
+        score_mask = torch.ones(score_embeds.shape[:2], dtype=torch.long, device=device)
+        if position_ids is not None:
+            last = position_ids[0, -1]
+            gen_pos = (last + torch.arange(1, len(r_ids) + 1, device=device)).unsqueeze(0)
+            score_pos = torch.cat([position_ids, gen_pos], dim=1)
+        else:
+            score_pos = torch.arange(score_embeds.shape[1], device=device).unsqueeze(0)
+
+        query_indices = list(range(prompt_len, prompt_len + len(r_ids)))
+        layer_rows = score_layers_multi(
+            model, score_embeds, score_mask, score_pos, layer_indices, query_indices
+        )
+
+        # geometry / views
+        vt = model.get_vision_tower()
+        patch_size = int(getattr(vt, "patch_size", 14) or 14)
+        vis_size = int(getattr(vt, "image_size", 384) or 384)
+        pps = int(getattr(vt, "num_patches_per_side", 27) or 27)
+        pinpoints = getattr(model.config, "image_grid_pinpoints", None)
+        max_patches = 9
+        iar = str(getattr(model.config, "image_aspect_ratio", "") or "")
+        m = re.search(r"anyres_max_(\d+)", iar)
+        if m:
+            max_patches = int(m.group(1))
+        any_hw = None
+        if seg["n_anyres"] > 0:
+            computed = llava_anyres_spatial_hw(
+                image.size, pinpoints, vis_size, pps,
+                max_num_patches=max_patches, n_anyres=seg["n_anyres"],
+            )
+            if computed is not None:
+                any_hw = (computed[0], computed[1])
+        bboxes = seg.get("bboxes") or []
+        if not bboxes and roi_bboxes and roi_bboxes[0]:
+            bboxes = roi_bboxes[0]
+        views = build_views(
+            image_size_wh=image.size,
+            n_base=int(seg["n_base"]),
+            n_anyres=int(seg["n_anyres"]),
+            roi_lens=seg.get("roi_lens") or [],
+            roi_spatial_shape=seg.get("roi_spatial_shape"),
+            bboxes=bboxes,
+            anyres_hw=any_hw,
+            patch_size=patch_size,
+            vis_start=vis_start,
+        )
+        target_view = next((v for v in views if v["name"] == view_name), None)
+        if target_view is None:
+            target_view = next((v for v in views if v["name"] == "base"), None)
+        if target_view is None:
+            return {"kept": False, "box": None, "reason": "no_view", "proposer": "real"}
+
+        # anchor positions in prompt-embedding coordinates
+        ids_list = input_ids[0].detach().cpu().tolist()
+        anchor_in = _find_anchor_positions(tokenizer, ids_list, anchor_words, IMAGE_TOKEN_INDEX)
+        anchor_pos = _shift_positions_to_prompt(anchor_in, ids_list, n_visual, IMAGE_TOKEN_INDEX)
+
+        # per reasoning-token S_T / S_I (averaged over the layer band)
+        n_q = len(r_ids)
+        S_T = np.zeros(n_q, dtype=np.float64)
+        S_I = np.zeros(n_q, dtype=np.float64)
+        n_used = 0
+        for _li, rows in layer_rows.items():
+            if rows.ndim != 2 or rows.shape[0] != n_q:
+                continue
+            for qi in range(n_q):
+                row = rows[qi]
+                if row.shape[-1] < vis_end:
+                    continue
+                visual = np.maximum(row[vis_start:vis_end], 0.0)[: n_packed + trailing].astype(np.float32)
+                S_T[qi] += _semantic_relevance(row, anchor_pos)
+                g = view_raw_spatial_grid(target_view, visual).astype(np.float32)
+                S_I[qi] += _concentration_score(g)
+            n_used += 1
+        if n_used == 0:
+            return {"kept": False, "box": None, "reason": "no_visual", "proposer": "real"}
+        S_T /= float(n_used)
+        S_I /= float(n_used)
+
+        # relative normalization + dual-threshold selection (no absolute cut)
+        def _norm01(v):
+            v = np.asarray(v, dtype=np.float64)
+            lo, hi = float(v.min()), float(v.max())
+            if hi - lo < 1e-9:
+                return np.zeros_like(v)
+            return (v - lo) / (hi - lo)
+
+        S_T_hat = _norm01(S_T)
+        S_I_hat = _norm01(S_I)
+        keep = np.ones(n_q, dtype=bool)
+        if keep_frac is not None and 0.0 < keep_frac < 1.0:
+            thresh_i = float(np.quantile(S_I_hat, 1.0 - keep_frac))
+            keep &= (S_I_hat >= thresh_i)
+        if tau_t > 0:
+            keep &= (S_T_hat >= tau_t)
+        if tau_i > 0:
+            keep &= (S_I_hat >= tau_i)
+        if not keep.any():
+            # fall back to the single most-concentrated token
+            keep[int(np.argmax(S_I_hat))] = True
+        w = alpha * S_T_hat + beta * S_I_hat
+        w = np.where(keep, np.maximum(w, 1e-6), 0.0)
+        if float(w.sum()) <= 0:
+            w = keep.astype(np.float64)
+
+        # aggregate RDAM: weighted sum (across selected tokens) of their visual maps,
+        # each computed by re-scoring the layer band once more (cheap: reuse rows).
+        rdam = None
+        for _li, rows in layer_rows.items():
+            if rows.ndim != 2 or rows.shape[0] != n_q:
+                continue
+            vis_sum = None
+            for qi in range(n_q):
+                if not keep[qi]:
+                    continue
+                row = rows[qi]
+                if row.shape[-1] < vis_end:
+                    continue
+                visual = np.maximum(row[vis_start:vis_end], 0.0)[: n_packed + trailing].astype(np.float32)
+                weighted = visual * float(w[qi])
+                vis_sum = weighted if vis_sum is None else vis_sum + weighted
+            if vis_sum is None:
+                continue
+            g = view_raw_spatial_grid(target_view, vis_sum / float(n_used)).astype(np.float32)
+            rdam = g if rdam is None else rdam + g
+        if rdam is None:
+            return {"kept": False, "box": None, "reason": "no_rdam", "proposer": "real"}
+
+        # de-sink the single hottest cell (attention sink on token id 0 etc.)
+        gm = rdam.astype(np.float64).copy()
+        if gm.size and float(gm.max()) > 0:
+            gm[np.unravel_index(int(np.argmax(gm)), gm.shape)] *= 0.25
+        rdam = gm.astype(np.float32)
+
+        res = grid_to_box(
+            rdam,
+            target_view["source_box_xyxy"],
+            image.size,
+            thr_q=thr_q, expand=expand, side_lo=side_lo, side_hi=side_hi, conc_floor=conc_floor,
+        )
+        res["proposer"] = "real"
+        res["layers"] = layer_indices
+        res["real"] = {
+            "view": target_view["name"],
+            "n_reasoning_tokens": int(n_q),
+            "n_kept": int(keep.sum()),
+            "n_anchor_tokens": len(anchor_pos),
+            "anchor_words": anchor_words,
+            "S_T_mean": round(float(S_T.mean()), 6) if n_q else 0.0,
+            "S_I_mean": round(float(S_I.mean()), 6) if n_q else 0.0,
+            "S_I_max": round(float(S_I.max()), 6) if n_q else 0.0,
+            "keep_frac": keep_frac,
+            "alpha": alpha, "beta": beta,
+            "top5_mass": res.get("top5_mass"),
+        }
+        res["config"] = {
+            "proposer": "real", "thr_q": thr_q, "expand": expand,
+            "side_lo": side_lo, "side_hi": side_hi, "conc_floor": conc_floor,
+        }
+        if isinstance(res.get("box"), (list, tuple)):
+            res["box"] = [round(float(v), 2) for v in res["box"]]
+
+        if overlay_path:
+            try:
+                save_attn_box_overlay(
+                    overlay_path, image, target_view, rdam,
+                    res.get("box"), title=overlay_title, display_size=display_size,
                 )
-                if computed is not None:
-                    any_hw = (computed[0], computed[1])
-            bboxes = seg.get("bboxes") or []
-            if not bboxes and roi_bboxes and roi_bboxes[0]:
-                bboxes = roi_bboxes[0]
-            views = build_views(
-                image_size_wh=image.size,
-                n_base=int(seg["n_base"]),
-                n_anyres=int(seg["n_anyres"]),
-                roi_lens=seg.get("roi_lens") or [],
-                roi_spatial_shape=seg.get("roi_spatial_shape"),
-                bboxes=bboxes,
-                anyres_hw=any_hw,
-                patch_size=patch_size,
-                vis_start=vis_start,
-            )
-            base_view = next((v for v in views if v["name"] == "base"), None)
-            if base_view is None:
-                return {"kept": False, "box": None, "reason": "no_base", "proposer": "margin_cam"}
-
-            grid = view_raw_spatial_grid(base_view, cam_full).astype(np.float32)
-            if grid.size <= 1 or float(grid.max()) <= 0:
-                return {"kept": False, "box": None, "reason": "cam_empty", "proposer": "margin_cam"}
-            grid = _smooth_grid(grid, smooth_k)
-            if float(grid.max()) <= 0:
-                return {"kept": False, "box": None, "reason": "cam_empty", "proposer": "margin_cam"}
-
-            res = grid_to_box(
-                grid,
-                base_view["source_box_xyxy"],
-                image.size,
-                thr_q=thr_q, expand=expand, side_lo=side_lo, side_hi=side_hi, conc_floor=conc_floor,
-            )
-            res["proposer"] = "margin_cam"
-            res["z_margin"] = z_margin
-            res["cam"] = {
-                "view": "base",
-                "grid_wh": [int(grid.shape[0]), int(grid.shape[1])],
-                "cam_max": round(float(grid.max()), 6),
-                "top5_mass": res.get("top5_mass"),
-                "grad_norm": round(float(G_all.norm()), 6),
-                "n_visual": int(n_visual),
-                "trailing": int(trailing),
-                "smooth_k": int(smooth_k),
-            }
-            res["config"] = {
-                "proposer": "margin_cam", "thr_q": thr_q, "expand": expand,
-                "side_lo": side_lo, "side_hi": side_hi, "conc_floor": conc_floor,
-            }
-            if isinstance(res.get("box"), (list, tuple)):
-                res["box"] = [round(float(v), 2) for v in res["box"]]
-
-            if overlay_path:
-                try:
-                    save_attn_box_overlay(
-                        overlay_path, image, base_view, cam_full,
-                        res.get("box"), title=overlay_title, display_size=display_size,
-                        map_name="cam",
-                    )
-                    res["overlay"] = overlay_path
-                except Exception as e:  # visualization must never break eval
-                    res["overlay_error"] = repr(e)
-            return res
+                res["overlay"] = overlay_path
+            except Exception as e:  # visualization must never break eval
+                res["overlay_error"] = repr(e)
+        return res
     finally:
         recorder.uninstall()
 
@@ -799,14 +1024,11 @@ def save_attn_box_overlay(
     *,
     title: Optional[str] = None,
     display_size: int = 640,
-    map_name: str = "attn",
 ) -> str:
-    """3-panel figure: original(+box) | heatmap overlay(+box) | crop.
+    """3-panel figure: original(+box) | attention overlay(+box) | crop.
 
-    The heat grid of ``view`` (``anyres`` for attention, ``base`` for the
-    margin-Grad-CAM proposer) is upsampled to the full image and blended with
-    the original; the crop box is drawn in red. ``map_name`` labels the heat
-    panel (``attn`` by default, ``cam`` for the Grad-CAM proposer).
+    The attention grid of ``view`` (usually ``anyres``) is upsampled to the full
+    image and blended with the original; the crop box is drawn in red.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     grid = _normalize01(view_raw_spatial_grid(view, visual_scores))  # (H, W)
@@ -836,7 +1058,7 @@ def save_attn_box_overlay(
 
     orig_panel = _with_box(img)
     ov_panel = _with_box(overlay_img)
-    panels = [("original", orig_panel), (str(map_name or "attn"), ov_panel)]
+    panels = [("original", orig_panel), ("attn", ov_panel)]
     if crop_img is not None:
         panels.append(("crop", crop_img))
 

@@ -201,7 +201,7 @@ if __name__ == "__main__":
         "--scheme_requery",
         type=str,
         default=None,
-        choices=["hyp", "hyp_v2", "selfq", "attncrop"],
+        choices=["hyp", "hyp_v2", "selfq", "attncrop", "real"],
         help=(
             "Hypothesis requery (v0 only). NEVER musc_scores. "
             "hyp: fixed-template H_A/H_B, hard +1 aggregate. "
@@ -352,31 +352,49 @@ if __name__ == "__main__":
         "Default 0.30.",
     )
     parser.add_argument(
-        "--requery_attncrop_proposer",
-        type=str,
-        default="margin_cam",
-        choices=["margin_cam", "attn"],
-        help="attncrop proposer: margin_cam (A/B margin Grad-CAM, pure model, default) "
-        "or attn (old decision-token attention).",
-    )
-    parser.add_argument(
-        "--requery_attncrop_cam_thr_q",
-        type=float,
-        default=0.60,
-        help="margin_cam: relative threshold on the normalized CAM grid for the blob. Default 0.60.",
-    )
-    parser.add_argument(
-        "--requery_attncrop_cam_conc_floor",
-        type=float,
-        default=0.25,
-        help="margin_cam: min top-5%% CAM mass to accept a box (else degenerate -> no crop). "
-        "Default 0.25.",
-    )
-    parser.add_argument(
         "--requery_attncrop_overlay_dir",
         type=str,
         default=None,
         help="attncrop: if set, write attention-overlay + crop-box PNGs (per sample id) here.",
+    )
+    parser.add_argument(
+        "--requery_real_keep_frac",
+        type=float,
+        default=0.5,
+        help="real: keep the top fraction of reasoning tokens by spatial concentration S_I. "
+        "Default 0.5.",
+    )
+    parser.add_argument(
+        "--requery_real_alpha",
+        type=float,
+        default=0.6,
+        help="real: weight alpha on S_T (semantic) in w = alpha*S_T + beta*S_I. Default 0.6.",
+    )
+    parser.add_argument(
+        "--requery_real_beta",
+        type=float,
+        default=0.4,
+        help="real: weight beta on S_I (concentration) in w = alpha*S_T + beta*S_I. Default 0.4.",
+    )
+    parser.add_argument(
+        "--requery_real_tau_t",
+        type=float,
+        default=0.0,
+        help="real: absolute floor on normalized S_T (0 disables). Default 0.0.",
+    )
+    parser.add_argument(
+        "--requery_real_tau_i",
+        type=float,
+        default=0.0,
+        help="real: absolute floor on normalized S_I (0 disables). Default 0.0.",
+    )
+    parser.add_argument(
+        "--requery_real_view",
+        type=str,
+        default="anyres",
+        choices=["anyres", "base"],
+        help="real: view to aggregate the RDAM grid on. anyres (fine) | base (linear geometry). "
+        "Default anyres.",
     )
     parser.add_argument(
         "--ecpr_sidecar",
@@ -426,9 +444,10 @@ if __name__ == "__main__":
     if args.scheme_requery is not None and ab_tau is not None:
         raise ValueError("Pick at most one of --scheme_requery, --ab_tau.")
     if args.scheme_requery is not None:
-        if prompt_version != "v0":
+        if str(args.scheme_requery).lower() != "real" and prompt_version != "v0":
             raise ValueError(
-                f"--scheme_requery requires config:v0 (got text_src={text_src!r})."
+                f"--scheme_requery requires config:v0 (got text_src={text_src!r}). "
+                f"Use --scheme_requery real with config:cotm_v3 for the ReAL crop path."
             )
         mode = str(args.scheme_requery)
         if args.requery_delta is not None:
@@ -464,15 +483,34 @@ if __name__ == "__main__":
                 requery["checklist"] = "default"
             requery["max_subq"] = int(args.requery_max_subq) if args.requery_max_subq != 2 else 3
             requery.update({
-                "attncrop_proposer": str(args.requery_attncrop_proposer),
                 "attncrop_layers": str(args.requery_attncrop_layers),
                 "attncrop_thr_q": float(args.requery_attncrop_thr_q),
-                "attncrop_cam_thr_q": float(args.requery_attncrop_cam_thr_q),
                 "attncrop_expand": float(args.requery_attncrop_expand),
                 "attncrop_side_lo": float(args.requery_attncrop_side_lo),
                 "attncrop_side_hi": float(args.requery_attncrop_side_hi),
                 "attncrop_conc_floor": float(args.requery_attncrop_conc_floor),
-                "attncrop_cam_conc_floor": float(args.requery_attncrop_cam_conc_floor),
+                "overlay_dir": args.requery_attncrop_overlay_dir,
+            })
+            if args.requery_attncrop_overlay_dir:
+                os.makedirs(args.requery_attncrop_overlay_dir, exist_ok=True)
+        if mode == "real":
+            # ReAL: cotm_v3 reasoning -> attention-crop requery (vote-flip).
+            if str(args.requery_checklist) == "per_class":
+                requery["checklist"] = "default"
+            requery["max_subq"] = int(args.requery_max_subq) if args.requery_max_subq != 2 else 3
+            requery.update({
+                "attncrop_layers": str(args.requery_attncrop_layers),
+                "attncrop_thr_q": float(args.requery_attncrop_thr_q),
+                "attncrop_expand": float(args.requery_attncrop_expand),
+                "attncrop_side_lo": float(args.requery_attncrop_side_lo),
+                "attncrop_side_hi": float(args.requery_attncrop_side_hi),
+                "attncrop_conc_floor": float(args.requery_attncrop_conc_floor),
+                "real_keep_frac": float(args.requery_real_keep_frac),
+                "real_alpha": float(args.requery_real_alpha),
+                "real_beta": float(args.requery_real_beta),
+                "real_tau_t": float(args.requery_real_tau_t),
+                "real_tau_i": float(args.requery_real_tau_i),
+                "real_view": str(args.requery_real_view),
                 "overlay_dir": args.requery_attncrop_overlay_dir,
             })
             if args.requery_attncrop_overlay_dir:
