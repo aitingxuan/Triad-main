@@ -1031,7 +1031,15 @@ def save_attn_box_overlay(
     image and blended with the original; the crop box is drawn in red.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    grid = _normalize01(view_raw_spatial_grid(view, visual_scores))  # (H, W)
+    # ``visual_scores`` may be either a flat per-token vector (attncrop path)
+    # or an already-materialized (H, W) spatial grid (real path passes ``rdam``).
+    # Only the flat form needs to be projected onto the view's spatial indices.
+    arr = np.asarray(visual_scores, dtype=np.float32)
+    rows, cols = int(view["grid_shape"][0]), int(view["grid_shape"][1])
+    if arr.ndim == 2 and arr.shape == (rows, cols):
+        grid = _normalize01(arr)  # already a spatial grid
+    else:
+        grid = _normalize01(view_raw_spatial_grid(view, visual_scores))  # (H, W)
     img = image.convert("RGB")
     w, h = img.size
     heat = np.asarray(
