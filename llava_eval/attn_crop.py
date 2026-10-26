@@ -1091,3 +1091,6 @@ def save_attn_box_overlay(
         canvas.paste(_fit(im), (x, title_h + label_h))
     canvas.save(path)
     return path
+
+
+from egroi_box import expand_box_eg_roi  # noqa: E402,F401  (re-export)

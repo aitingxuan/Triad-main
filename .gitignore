@@ -40,6 +40,7 @@
 /Seg_juice/juice_interest_masks_cotm/
 /Seg_juice/LogSAD-master/
 /Opt_module/
+/result_on_other_device/
 
 # ===== 实验输出 / 日志 =====
 /outputs/

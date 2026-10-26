@@ -271,20 +271,43 @@ class SimpleModelWorker:
 
             if real_meta and real_meta.get("kept"):
                 box = real_meta.get("box")
+            if box is not None and str(requery.get("box_expand", "none")).lower() == "egroi":
+                from attn_crop import expand_box_eg_roi
+                img_wh = (raw_images[0].width, raw_images[0].height) if raw_images else (1, 1)
+                box = expand_box_eg_roi(
+                    box, img_wh, min_side=float(requery.get("box_min_side", 384))
+                )
+                if isinstance(real_meta, dict):
+                    real_meta["box_expanded"] = [round(float(v), 2) for v in box]
 
-            # 4) crop + H_A/H_B vote-flip on the crop
+            # 4) crop + final decision on the crop (H_A/H_B vote or v0crop A/B)
             final_yes = orig_yes
             decision_src = "real_no_crop"
             sub_records = []
             S_A = 0.0
             S_B = 0.0
-            if box is not None and orig_yes is not None:
+            v0_yes = None
+            final_mode = str(requery.get("final", "checklist")).lower()
+            final_gate = str(requery.get("final_gate", "all")).lower()
+            if box is not None and (orig_yes is not None or final_mode == "v0crop"):
                 if self._ab_token_ids is None:
                     self._ab_token_ids = resolve_ab_token_ids(tokenizer)
                 ab_ids = self._ab_token_ids
                 if ab_ids.get("A") and ab_ids.get("B"):
                     def _build_sub_prompt(question_text):
                         body = DEFAULT_IMAGE_TOKEN + "\n" + format_subq(question_text)
+                        if use_im_se:
+                            body = body.replace(
+                                DEFAULT_IMAGE_TOKEN,
+                                DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN,
+                            )
+                        conv = conv_templates[tmpl].copy()
+                        conv.append_message(conv.roles[0], body)
+                        conv.append_message(conv.roles[1], None)
+                        return conv.get_prompt()
+
+                    def _build_final_prompt(question_text):
+                        body = DEFAULT_IMAGE_TOKEN + "\n" + str(question_text)
                         if use_im_se:
                             body = body.replace(
                                 DEFAULT_IMAGE_TOKEN,
@@ -327,46 +350,82 @@ class SimpleModelWorker:
                         crop_images = crop_images.to(model.device, dtype=model.dtype)
                     ia_crop = {"images": crop_images, "image_sizes": image_sizes, "roi_bboxes": crop_roi}
 
-                    for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
-                        for q in qlist:
-                            sp_a, sp_b = _ab_forward_local(_build_sub_prompt(q), ia_crop)
-                            conf = max(sp_a, sp_b)
-                            ans_letter = "A" if sp_a >= 0.5 else "B"
-                            sub_records.append({
-                                "hyp": hyp_tag, "q": q, "p_A": sp_a, "p_B": sp_b,
-                                "letter": ans_letter, "conf": conf, "kept": conf >= tau_ev,
-                                "view": "real_crop",
-                            })
-                    for rec in sub_records:
-                        if not rec.get("kept"):
-                            continue
-                        if rec["hyp"] == "H_A":
-                            if rec["letter"] == "A":
-                                S_A += 1.0
-                            else:
-                                S_B += 1.0
+                    crop_dir = requery.get("crop_dir")
+                    if crop_dir:
+                        try:
+                            os.makedirs(crop_dir, exist_ok=True)
+                            safe_id = _re.sub(r"[^\w.\-]+", "_", str(params.get("sample_id") or "sample"))[:100]
+                            safe_sub = _re.sub(r"[^\w.\-]+", "_", str(params.get("subset") or "sub"))[:40]
+                            x0, y0, x1, y1 = [int(round(float(v))) for v in box[:4]]
+                            raw_images[0].crop((x0, y0, x1, y1)).save(
+                                os.path.join(crop_dir, f"{safe_sub}__{safe_id}.png")
+                            )
+                        except Exception:
+                            pass
+
+                    if final_mode == "v0crop":
+                        fp = requery.get("final_prompt") or (
+                            f"Are there any defects on the {params.get('subset', 'object')} in this image?\n"
+                            "A. Yes\nB. No\nAnswer with the option's letter from the given choices directly."
+                        )
+                        sp_a, sp_b = _ab_forward_local(_build_final_prompt(fp), ia_crop)
+                        v0_yes = 1 if sp_a >= 0.5 else 0
+                        sub_records.append({
+                            "hyp": "V0CROP", "q": fp, "p_A": sp_a, "p_B": sp_b,
+                            "letter": "A" if sp_a >= 0.5 else "B",
+                            "conf": max(sp_a, sp_b), "kept": True, "view": "egroi_crop",
+                        })
+                        S_A = sp_a
+                        S_B = sp_b
+                        if final_gate == "no_answer" and orig_yes is not None:
+                            final_yes, decision_src = orig_yes, "v0crop_skipped_confident"
                         else:
-                            if rec["letter"] == "A":
-                                S_B += 1.0
-                            else:
-                                S_A += 1.0
-                    if S_A - S_B >= delta:
-                        final_yes, decision_src = 1, "real_crop_vote"
-                    elif S_B - S_A >= delta:
-                        final_yes, decision_src = 0, "real_crop_vote"
+                            final_yes, decision_src = v0_yes, "v0crop_ab"
                     else:
-                        final_yes, decision_src = orig_yes, "real_crop_agree"
+                        for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
+                            for q in qlist:
+                                sp_a, sp_b = _ab_forward_local(_build_sub_prompt(q), ia_crop)
+                                conf = max(sp_a, sp_b)
+                                ans_letter = "A" if sp_a >= 0.5 else "B"
+                                sub_records.append({
+                                    "hyp": hyp_tag, "q": q, "p_A": sp_a, "p_B": sp_b,
+                                    "letter": ans_letter, "conf": conf, "kept": conf >= tau_ev,
+                                    "view": "real_crop",
+                                })
+                        for rec in sub_records:
+                            if not rec.get("kept"):
+                                continue
+                            if rec["hyp"] == "H_A":
+                                if rec["letter"] == "A":
+                                    S_A += 1.0
+                                else:
+                                    S_B += 1.0
+                            else:
+                                if rec["letter"] == "A":
+                                    S_B += 1.0
+                                else:
+                                    S_A += 1.0
+                        if S_A - S_B >= delta:
+                            final_yes, decision_src = 1, "real_crop_vote"
+                        elif S_B - S_A >= delta:
+                            final_yes, decision_src = 0, "real_crop_vote"
+                        else:
+                            final_yes, decision_src = orig_yes, "real_crop_agree"
                 else:
                     decision_src = "real_crop_no_ab_ids"
 
-            # 5) rewrite <answer> if a flip happened
-            if final_yes is not None and orig_yes is not None and final_yes != orig_yes:
+            # 5) rewrite (or append) <answer> when the final decision changed
+            if final_yes is not None and final_yes != orig_yes:
                 new_tag = "Yes" if final_yes == 1 else "No"
-                full_text = _re.sub(
+                new_text, n_sub = _re.subn(
                     r"<answer>\s*(?:Yes|No)\s*</answer>",
                     f"<answer>{new_tag}</answer>",
                     full_text, count=1, flags=_re.I,
                 )
+                if n_sub:
+                    full_text = new_text
+                else:
+                    full_text = full_text.rstrip() + f"\n<answer>{new_tag}</answer>"
 
             self.last_ab_decision = {
                 "mode": "real",
@@ -374,6 +433,9 @@ class SimpleModelWorker:
                 "used_crop": box is not None,
                 "orig_yes": orig_yes,
                 "final_yes": final_yes,
+                "v0_yes": v0_yes,
+                "final_mode": final_mode,
+                "final_gate": final_gate,
                 "decision_src": decision_src,
                 "S_A": S_A,
                 "S_B": S_B,
@@ -490,6 +552,17 @@ class SimpleModelWorker:
                     def _build_sub_prompt(question_text):
                         conv = conv_templates[tmpl].copy()
                         body = DEFAULT_IMAGE_TOKEN + "\n" + format_subq(question_text)
+                        conv.append_message(conv.roles[0], body)
+                        conv.append_message(conv.roles[1], None)
+                        pr = conv.get_prompt()
+                        if use_im_se:
+                            rt = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+                            pr = pr.replace(DEFAULT_IMAGE_TOKEN, rt)
+                        return pr
+
+                    def _build_final_prompt(question_text):
+                        conv = conv_templates[tmpl].copy()
+                        body = DEFAULT_IMAGE_TOKEN + "\n" + str(question_text)
                         conv.append_message(conv.roles[0], body)
                         conv.append_message(conv.roles[1], None)
                         pr = conv.get_prompt()
@@ -629,6 +702,14 @@ class SimpleModelWorker:
 
                         if attn_meta and attn_meta.get("kept"):
                             box = attn_meta.get("box")
+                        if box is not None and str(requery.get("box_expand", "none")).lower() == "egroi":
+                            from attn_crop import expand_box_eg_roi
+                            img_wh = (raw_images[0].width, raw_images[0].height) if raw_images else (1, 1)
+                            box = expand_box_eg_roi(
+                                box, img_wh, min_side=float(requery.get("box_min_side", 384))
+                            )
+                            if isinstance(attn_meta, dict):
+                                attn_meta["box_expanded"] = [round(float(v), 2) for v in box]
 
                         if box is not None:
                             crop_images, crop_roi = process_images(
@@ -648,43 +729,76 @@ class SimpleModelWorker:
                                 "image_sizes": image_sizes,
                                 "roi_bboxes": crop_roi,
                             }
-                            for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
-                                for q in qlist:
-                                    _, _, sp_a, sp_b = _ab_forward_prompt(_build_sub_prompt(q), ia_crop)
-                                    conf = max(sp_a, sp_b)
-                                    ans_letter = "A" if sp_a >= 0.5 else "B"
-                                    sub_records.append({
-                                        "hyp": hyp_tag,
-                                        "q": q,
-                                        "p_A": sp_a,
-                                        "p_B": sp_b,
-                                        "letter": ans_letter,
-                                        "conf": conf,
-                                        "kept": conf >= tau_ev,
-                                        "view": "attncrop",
-                                    })
-                            for rec in sub_records:
-                                if not rec.get("kept"):
-                                    continue
-                                if rec["hyp"] == "H_A":
-                                    if rec["letter"] == "A":
-                                        S_A += 1.0
-                                    else:
-                                        S_B += 1.0
-                                else:
-                                    if rec["letter"] == "A":
-                                        S_B += 1.0
-                                    else:
-                                        S_A += 1.0
-                            if S_A - S_B >= delta:
-                                letter = "A"
-                                decision_src = "attncrop_test"
-                            elif S_B - S_A >= delta:
-                                letter = "B"
-                                decision_src = "attncrop_test"
+                            crop_dir = requery.get("crop_dir")
+                            if crop_dir:
+                                try:
+                                    os.makedirs(crop_dir, exist_ok=True)
+                                    safe_id = re.sub(r"[^\w.\-]+", "_", str(params.get("sample_id") or "sample"))[:100]
+                                    safe_sub = re.sub(r"[^\w.\-]+", "_", str(subset or "sub"))[:40]
+                                    x0, y0, x1, y1 = [int(round(float(v))) for v in box[:4]]
+                                    raw_images[0].crop((x0, y0, x1, y1)).save(
+                                        os.path.join(crop_dir, f"{safe_sub}__{safe_id}.png")
+                                    )
+                                except Exception:
+                                    pass
+
+                            if str(requery.get("final", "checklist")).lower() == "v0crop":
+                                fp = requery.get("final_prompt") or (
+                                    f"Are there any defects on the {subset or 'object'} in this image?\n"
+                                    "A. Yes\nB. No\nAnswer with the option's letter from the given choices directly."
+                                )
+                                _, _, sp_a, sp_b = _ab_forward_prompt(_build_final_prompt(fp), ia_crop)
+                                letter = "A" if sp_a >= 0.5 else "B"
+                                decision_src = "attncrop_v0crop"
+                                S_A, S_B = sp_a, sp_b
+                                sub_records.append({
+                                    "hyp": "V0CROP",
+                                    "q": fp,
+                                    "p_A": sp_a,
+                                    "p_B": sp_b,
+                                    "letter": letter,
+                                    "conf": max(sp_a, sp_b),
+                                    "kept": True,
+                                    "view": "egroi_crop",
+                                })
                             else:
-                                letter = llm_letter
-                                decision_src = "attncrop_fallback"
+                                for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
+                                    for q in qlist:
+                                        _, _, sp_a, sp_b = _ab_forward_prompt(_build_sub_prompt(q), ia_crop)
+                                        conf = max(sp_a, sp_b)
+                                        ans_letter = "A" if sp_a >= 0.5 else "B"
+                                        sub_records.append({
+                                            "hyp": hyp_tag,
+                                            "q": q,
+                                            "p_A": sp_a,
+                                            "p_B": sp_b,
+                                            "letter": ans_letter,
+                                            "conf": conf,
+                                            "kept": conf >= tau_ev,
+                                            "view": "attncrop",
+                                        })
+                                for rec in sub_records:
+                                    if not rec.get("kept"):
+                                        continue
+                                    if rec["hyp"] == "H_A":
+                                        if rec["letter"] == "A":
+                                            S_A += 1.0
+                                        else:
+                                            S_B += 1.0
+                                    else:
+                                        if rec["letter"] == "A":
+                                            S_B += 1.0
+                                        else:
+                                            S_A += 1.0
+                                if S_A - S_B >= delta:
+                                    letter = "A"
+                                    decision_src = "attncrop_test"
+                                elif S_B - S_A >= delta:
+                                    letter = "B"
+                                    decision_src = "attncrop_test"
+                                else:
+                                    letter = llm_letter
+                                    decision_src = "attncrop_fallback"
                         else:
                             letter = llm_letter
                             decision_src = "attncrop_fallback_nobox"

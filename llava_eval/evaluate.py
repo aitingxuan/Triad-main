@@ -20,6 +20,25 @@ from PIL import Image
 from copy import deepcopy
 from simple_model_worker import SimpleModelWrapper,TransformersModelWrapper
 
+
+def _generic_v0_prompt(subset):
+    name = str(subset or "object").replace("_", " ")
+    return (
+        f"Are there any defects on the {name} in this image?\n"
+        "A. Yes\n"
+        "B. No\n"
+        "Answer with the option's letter from the given choices directly."
+    )
+
+
+def _resolve_final_prompt(prompt_src, subset):
+    """Pick the fixed v0 binary prompt for one sample."""
+    if isinstance(prompt_src, dict):
+        return prompt_src.get(subset) or prompt_src.get("default") or _generic_v0_prompt(subset)
+    if isinstance(prompt_src, str) and prompt_src:
+        return prompt_src
+    return _generic_v0_prompt(subset)
+
 def make_convs(convs,img_num=0):
     '''
     make_convs -> dict convert a list of convs to dict to meet limit of llava train data
@@ -397,6 +416,48 @@ if __name__ == "__main__":
         "Default anyres.",
     )
     parser.add_argument(
+        "--requery_box_expand",
+        type=str,
+        default="none",
+        choices=["none", "egroi"],
+        help="real/attncrop: none keeps the raw attention box; egroi expands it to a square "
+        "EG-RoI ROI with side >= --requery_box_min_side. Default none.",
+    )
+    parser.add_argument(
+        "--requery_box_min_side",
+        type=int,
+        default=384,
+        help="egroi: minimum square side in ORIGINAL pixels (EG-RoI convention). Default 384.",
+    )
+    parser.add_argument(
+        "--requery_final",
+        type=str,
+        default="checklist",
+        choices=["checklist", "v0crop"],
+        help="real/attncrop: checklist keeps the H_A/H_B vote; v0crop asks a single fixed "
+        "v0 A/B question on the (expanded) ROI and uses that as the final decision.",
+    )
+    parser.add_argument(
+        "--requery_final_text_src",
+        type=str,
+        default="config:v0",
+        help="v0crop: prompt source for the fixed binary question. Default config:v0.",
+    )
+    parser.add_argument(
+        "--requery_final_gate",
+        type=str,
+        default="all",
+        choices=["all", "no_answer"],
+        help="v0crop: all overrides every sample with a box; no_answer only overrides when the "
+        "long-CoT output had no parseable <answer>. Default all.",
+    )
+    parser.add_argument(
+        "--requery_crop_dir",
+        type=str,
+        default=None,
+        help="real/attncrop: if set, save the (expanded) ROI crop PNGs here for inspection.",
+    )
+    parser.add_argument(
         "--ecpr_sidecar",
         type=str,
         default=None,
@@ -490,9 +551,17 @@ if __name__ == "__main__":
                 "attncrop_side_hi": float(args.requery_attncrop_side_hi),
                 "attncrop_conc_floor": float(args.requery_attncrop_conc_floor),
                 "overlay_dir": args.requery_attncrop_overlay_dir,
+                "box_expand": str(args.requery_box_expand).lower(),
+                "box_min_side": int(args.requery_box_min_side),
+                "final": str(args.requery_final).lower(),
+                "final_text_src": str(args.requery_final_text_src),
+                "final_gate": str(args.requery_final_gate).lower(),
+                "crop_dir": args.requery_crop_dir,
             })
             if args.requery_attncrop_overlay_dir:
                 os.makedirs(args.requery_attncrop_overlay_dir, exist_ok=True)
+            if args.requery_crop_dir:
+                os.makedirs(args.requery_crop_dir, exist_ok=True)
         if mode == "real":
             # ReAL: cotm_v3 reasoning -> attention-crop requery (vote-flip).
             if str(args.requery_checklist) == "per_class":
@@ -512,15 +581,39 @@ if __name__ == "__main__":
                 "real_tau_i": float(args.requery_real_tau_i),
                 "real_view": str(args.requery_real_view),
                 "overlay_dir": args.requery_attncrop_overlay_dir,
+                "box_expand": str(args.requery_box_expand).lower(),
+                "box_min_side": int(args.requery_box_min_side),
+                "final": str(args.requery_final).lower(),
+                "final_text_src": str(args.requery_final_text_src),
+                "final_gate": str(args.requery_final_gate).lower(),
+                "crop_dir": args.requery_crop_dir,
             })
             if args.requery_attncrop_overlay_dir:
                 os.makedirs(args.requery_attncrop_overlay_dir, exist_ok=True)
+            if args.requery_crop_dir:
+                os.makedirs(args.requery_crop_dir, exist_ok=True)
     if ab_tau is not None:
         if prompt_version != "v0":
             raise ValueError(
                 f"--ab_tau={ab_tau} forces single-token A/B and must not be used with "
                 f"text_src={text_src!r}. Use only with config:v0; for cotm_* omit --ab_tau."
             )
+
+    # v0crop: resolve the fixed binary prompt (per-subset dict or plain string).
+    final_qs_tmp = None
+    if requery is not None and str(requery.get("final", "checklist")).lower() == "v0crop":
+        fsrc = str(requery.get("final_text_src", "config:v0"))
+        if fsrc.startswith("config:"):
+            fv = fsrc.replace("config:", "", 1)
+            if ds_name in SUPPORTED_QSET and fv in SUPPORTED_QSET[ds_name]:
+                final_qs_tmp = SUPPORTED_QSET[ds_name][fv]
+            else:
+                print(f"WARNING: final_text_src {fsrc!r} not found for ds={ds_name}; using generic v0 prompt")
+        elif fsrc.startswith("input:"):
+            final_qs_tmp = fsrc.replace("input:", "", 1)
+        elif fsrc != "dataset":
+            raise ValueError(f"unknown --requery_final_text_src: {fsrc!r}")
+
     print(
         f"decode: temperature={args.temperature}, "
         f"ab_tau={ab_tau if ab_tau is not None else 'off'}, "
@@ -576,11 +669,19 @@ if __name__ == "__main__":
     def _eval_one(d, requery_cfg):
         """Run one sample; requery_cfg may be None or a per-pass requery dict."""
         subset = d["subset"]
+        if requery_cfg is not None and str(requery_cfg.get("final", "checklist")).lower() == "v0crop":
+            requery_cfg = dict(requery_cfg)
+            if requery_cfg.get("final_prompt") is None:
+                requery_cfg["final_prompt"] = _resolve_final_prompt(final_qs_tmp, subset)
         if type(qs_tmp) is dict:
             if subset not in qs_tmp:
-                if "default" not in qs_tmp:
+                if "default" in qs_tmp:
+                    qs = qs_tmp["default"]
+                elif prompt_version == "v0":
+                    print(f"WARNING: subset {subset} not in v0 prompts for {ds_name}; using generic v0 prompt")
+                    qs = _generic_v0_prompt(subset)
+                else:
                     raise ValueError(f"subset {subset} in {ds_name} version {v} not in eval config")
-                qs = qs_tmp["default"]
             else:
                 qs = qs_tmp[subset]
         else:
@@ -705,6 +806,9 @@ if __name__ == "__main__":
                     boxes_list = [ecpr_boxes]
                     masks = [None] * len(imgs) if masks is not None else None
 
+        sample_id = d.get("id") or d.get("origin_path") or d.get("image")
+        if isinstance(sample_id, (list, tuple)):
+            sample_id = sample_id[0] if sample_id else None
         inputs = {
             "text": qs,
             "temperature": args.temperature,
@@ -717,7 +821,7 @@ if __name__ == "__main__":
             "ab_tau": ab_tau,
             "requery": requery_cfg,
             "subset": subset,
-            "sample_id": d.get("id"),
+            "sample_id": sample_id,
         }
 
         assert worker is not None
