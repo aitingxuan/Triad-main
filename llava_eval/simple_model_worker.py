@@ -287,6 +287,7 @@ class SimpleModelWorker:
             S_A = 0.0
             S_B = 0.0
             v0_yes = None
+            p_a_full = None
             final_mode = str(requery.get("final", "checklist")).lower()
             final_gate = str(requery.get("final_gate", "all")).lower()
             if box is not None and (orig_yes is not None or final_mode == "v0crop"):
@@ -368,19 +369,32 @@ class SimpleModelWorker:
                             f"Are there any defects on the {params.get('subset', 'object')} in this image?\n"
                             "A. Yes\nB. No\nAnswer with the option's letter from the given choices directly."
                         )
-                        sp_a, sp_b = _ab_forward_local(_build_final_prompt(fp), ia_crop)
-                        v0_yes = 1 if sp_a >= 0.5 else 0
-                        sub_records.append({
-                            "hyp": "V0CROP", "q": fp, "p_A": sp_a, "p_B": sp_b,
-                            "letter": "A" if sp_a >= 0.5 else "B",
-                            "conf": max(sp_a, sp_b), "kept": True, "view": "egroi_crop",
-                        })
-                        S_A = sp_a
-                        S_B = sp_b
-                        if final_gate == "no_answer" and orig_yes is not None:
-                            final_yes, decision_src = orig_yes, "v0crop_skipped_confident"
-                        else:
-                            final_yes, decision_src = v0_yes, "v0crop_ab"
+                        use_crop = True
+                        p_a_full = None
+                        if final_gate == "band":
+                            p_a_full, _ = _ab_forward_local(_build_final_prompt(fp), image_args)
+                            lo = float(requery.get("lo", 0.4))
+                            hi = float(requery.get("hi", 0.7))
+                            use_crop = (lo <= p_a_full <= hi)
+                            if not use_crop:
+                                v0_yes = 1 if p_a_full >= 0.5 else 0
+                                final_yes, decision_src = v0_yes, "v0_full_out_of_band"
+                                S_A, S_B = p_a_full, 1.0 - p_a_full
+
+                        if use_crop:
+                            sp_a, sp_b = _ab_forward_local(_build_final_prompt(fp), ia_crop)
+                            v0_yes = 1 if sp_a >= 0.5 else 0
+                            sub_records.append({
+                                "hyp": "V0CROP", "q": fp, "p_A": sp_a, "p_B": sp_b,
+                                "letter": "A" if sp_a >= 0.5 else "B",
+                                "conf": max(sp_a, sp_b), "kept": True, "view": "egroi_crop",
+                            })
+                            S_A = sp_a
+                            S_B = sp_b
+                            if final_gate == "no_answer" and orig_yes is not None:
+                                final_yes, decision_src = orig_yes, "v0crop_skipped_confident"
+                            else:
+                                final_yes, decision_src = v0_yes, "v0crop_ab"
                     else:
                         for hyp_tag, qlist in (("H_A", ha_qs), ("H_B", hb_qs)):
                             for q in qlist:
@@ -434,6 +448,7 @@ class SimpleModelWorker:
                 "orig_yes": orig_yes,
                 "final_yes": final_yes,
                 "v0_yes": v0_yes,
+                "p_a_full": p_a_full,
                 "final_mode": final_mode,
                 "final_gate": final_gate,
                 "decision_src": decision_src,
@@ -442,8 +457,12 @@ class SimpleModelWorker:
                 "flipped": (orig_yes is not None and final_yes is not None and final_yes != orig_yes),
                 "sub_answers": sub_records,
                 "real": real_meta,
+                "cot_text": full_text,
                 "requery": dict(requery),
             }
+            if final_mode == "v0crop":
+                # Emit the same A/B token that collect_acc.py already expects.
+                return "A" if final_yes == 1 else ("B" if final_yes == 0 else "?")
             return full_text
 
         if use_ab_score:

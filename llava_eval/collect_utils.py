@@ -154,6 +154,31 @@ def extract_pred_label(datas,only_last=False):
                     label.append(c["old_value"].lower())
     return pred,label
 
+def _choice_from_text(value):
+    '''
+    normalize one free-form answer string into "A"/"B".
+    Supports bare "A"/"B", bare Yes/No, and the cotm-style <answer>Yes|No</answer> tag.
+    Returns None when nothing usable is found.
+    '''
+    import re
+    v = str(value).strip()
+    ms = re.findall(r"<answer>\s*(Yes|No)\s*</answer>", v, re.I)
+    if ms:
+        return "A" if ms[-1].lower() == "yes" else "B"
+    v2 = v.strip().strip(",.").strip()
+    if v2.upper() in ("A", "B"):
+        return v2.upper()
+    if v2.lower() in ("yes", "no"):
+        return "A" if v2.lower() == "yes" else "B"
+    m = re.search(r"\b([AB])\b\s*[.!]?\s*$", v2)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"\b(Yes|No)\b\s*[.!]?\s*$", v2, re.I)
+    if m:
+        return "A" if m.group(1).lower() == "yes" else "B"
+    return None
+
+
 def extract_pred_label_choice(datas,label_key="gt",key_map={"1":"A","0":"B"},only_last=True):
     '''
     extract pred and label from ans in llava train data format, will load biniary gt from ans file
@@ -164,10 +189,16 @@ def extract_pred_label_choice(datas,label_key="gt",key_map={"1":"A","0":"B"},onl
     '''
     pred=[]
     label=[]
+    unparsed=[]
     for data in datas:
         conv=data["conversations"]
         if only_last: # choice only extract the last one
-            pred.append(conv[-1]["value"].strip().strip(",.").strip())
+            raw=conv[-1]["value"]
+            p=_choice_from_text(raw)
+            if p is None:
+                unparsed.append(data.get("id") or data.get("question_id"))
+                p=str(raw).strip().strip(",.").strip()  # will simply not match -> counted wrong
+            pred.append(p)
             l=data.get(label_key,None)
             if l is None:
                 raise ValueError(f"data item {data} has no keyword {label_key} for label")
@@ -177,4 +208,7 @@ def extract_pred_label_choice(datas,label_key="gt",key_map={"1":"A","0":"B"},onl
             assert l in key_map, f"label {l} is not in key_map {key_map} for data item {data}"
             l=key_map[l]
             label.append(l)
+    if unparsed:
+        import sys
+        print(f"[extract_pred_label_choice] parse_fail={len(unparsed)}/{len(datas)}", file=sys.stderr)
     return pred,label

@@ -447,9 +447,10 @@ if __name__ == "__main__":
         "--requery_final_gate",
         type=str,
         default="all",
-        choices=["all", "no_answer"],
+        choices=["all", "no_answer", "band"],
         help="v0crop: all overrides every sample with a box; no_answer only overrides when the "
-        "long-CoT output had no parseable <answer>. Default all.",
+        "long-CoT output had no parseable <answer>; band only overrides when a v0 probe on the "
+        "FULL image lands in [--band_lo, --band_hi]. Default all.",
     )
     parser.add_argument(
         "--requery_crop_dir",

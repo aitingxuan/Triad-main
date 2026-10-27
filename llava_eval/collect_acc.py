@@ -27,4 +27,8 @@ if __name__=="__main__":
         pred,label=extract_pred_label_choice(all_datas)
         # actually same function with sklearn.metrics.accuracy_score for less encapsulation
         res=binary_collector(pred,label,is_pos=is_pos,classnames=classnames) # pass is_pos if you want correct TNR
+        # write the same CSV string next to the answer file: <answer>_acc.csv
+        out_csv=os.path.splitext(rt)[0]+"_acc.csv"
+        save_csv(out_csv,res)
         print(res)
+        print(f"csv -> {out_csv}")
