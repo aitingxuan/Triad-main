@@ -768,6 +768,124 @@ def run_tsne_and_stats(all_rows: List[dict], X: np.ndarray, out_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# Per-class t-SNE by sample outcome (correct/wrong + pred normal/abnormal)
+# ---------------------------------------------------------------------------
+
+def _safe_name(s) -> str:
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s))[:60]
+
+
+def _scatter_outcome_panel(ax, emb: np.ndarray, labels: np.ndarray,
+                           mapping: dict, title: str) -> None:
+    """Scatter points colored by category; legend shows per-category counts."""
+    ax.set_title(title)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    known = np.zeros(len(labels), dtype=bool)
+    for val, (name, color) in mapping.items():
+        m = np.array([l == val for l in labels], dtype=bool)
+        known |= m
+        if m.any():
+            ax.scatter(emb[m, 0], emb[m, 1], s=12, alpha=0.7, c=color,
+                       label=f"{name} ({int(m.sum())})")
+    unk = ~known
+    if unk.any():
+        ax.scatter(emb[unk, 0], emb[unk, 1], s=10, alpha=0.35, c="#bbbbbb",
+                   label=f"unknown ({int(unk.sum())})")
+    ax.legend(markerscale=2, fontsize=9, loc="best")
+
+
+def run_per_class_outcome_tsne(tsne_rows: List[dict], X: np.ndarray, out_dir: str,
+                               args) -> dict:
+    """One t-SNE per class (subset), each with two panels:
+       (left)  tokens from correct vs wrong samples
+       (right) tokens from samples the model predicted normal vs abnormal
+    """
+    stats: dict = {"enabled": False, "classes": {}}
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+    except Exception as e:  # pragma: no cover
+        stats["error"] = repr(e)
+        print(f"[tsne-per-class] sklearn/matplotlib unavailable: {e}")
+        return stats
+
+    subsets = np.array([str(r.get("subset")) for r in tsne_rows], dtype=object)
+    classes = sorted(set(str(c) for c in subsets.tolist()))
+    stats["enabled"] = True
+    stats["n_classes"] = len(classes)
+    rng = np.random.default_rng(args.seed)
+
+    for cls in classes:
+        idx = np.where(subsets == cls)[0]
+        if len(idx) < int(getattr(args, "per_class_min_words", 30)):
+            stats["classes"][cls] = {"skipped": "too_few_words", "n_words": int(len(idx))}
+            continue
+
+        # cap per class to keep t-SNE stable / fast
+        if args.tsne_max and len(idx) > args.tsne_max:
+            idx = np.sort(rng.choice(idx, size=int(args.tsne_max), replace=False))
+
+        X_sub = X[idx]
+        try:
+            Xs = StandardScaler().fit_transform(X_sub)
+            k = int(min(args.pca_dim, Xs.shape[1], len(idx) - 1))
+            Xp = PCA(n_components=max(2, k), random_state=args.seed).fit_transform(Xs)
+            perp = float(min(args.perplexity, max(5, len(idx) / 4.0)))
+            emb = TSNE(n_components=2, perplexity=perp, init="pca",
+                       learning_rate="auto", random_state=args.seed).fit_transform(Xp)
+        except Exception as e:
+            stats["classes"][cls] = {"error": repr(e), "n_words": int(len(idx))}
+            print(f"[tsne-per-class][ERR] {cls}: {e}")
+            continue
+
+        rows_c = [tsne_rows[i] for i in idx]
+        correct = np.array([r.get("_sample_correct") for r in rows_c], dtype=object)
+        pred = np.array([r.get("_sample_pred") for r in rows_c], dtype=object)
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+        _scatter_outcome_panel(
+            axes[0], emb, correct, {1: ("correct", "#2ca02c"), 0: ("wrong", "#d62728")},
+            "tokens: correct vs wrong samples",
+        )
+        _scatter_outcome_panel(
+            axes[1], emb, pred, {0: ("pred normal", "#1f77b4"), 1: ("pred abnormal", "#ff7f0e")},
+            "tokens: model predicted normal vs abnormal",
+        )
+        fig.suptitle(f"t-SNE of word attention maps — {cls}  (n={len(idx)})",
+                     fontsize=12)
+        fig.tight_layout()
+        out_path = os.path.join(out_dir, f"tsne_{_safe_name(cls)}_outcome.png")
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+
+        stats["classes"][cls] = {
+            "path": out_path,
+            "n_words": int(len(idx)),
+            "n_correct": int(sum(1 for v in correct if v == 1)),
+            "n_wrong": int(sum(1 for v in correct if v == 0)),
+            "n_unknown_correct": int(sum(1 for v in correct if v is None)),
+            "n_pred_normal": int(sum(1 for v in pred if v == 0)),
+            "n_pred_abnormal": int(sum(1 for v in pred if v == 1)),
+            "n_unknown_pred": int(sum(1 for v in pred if v is None)),
+            "perplexity": float(perp),
+        }
+        print(f"[tsne-per-class] {cls}: n={len(idx)} "
+              f"correct={stats['classes'][cls]['n_correct']} "
+              f"wrong={stats['classes'][cls]['n_wrong']} "
+              f"predN={stats['classes'][cls]['n_pred_normal']} "
+              f"predA={stats['classes'][cls]['n_pred_abnormal']} "
+              f"-> {out_path}")
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -878,6 +996,8 @@ def main():
     ap.add_argument("--pca-dim", type=int, default=16)
     ap.add_argument("--perplexity", type=float, default=30.0)
     ap.add_argument("--tsne-max", type=int, default=4000, help="subsample words for the t-SNE plot")
+    ap.add_argument("--per-class-min-words", type=int, default=30,
+                    help="skip a class in the per-class outcome t-SNE if it has fewer words than this")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="LLM_judge_output/word_grounding")
     args = ap.parse_args()
@@ -959,6 +1079,8 @@ def main():
                 "role": wr["role"], "word": wr["word"], "n_tokens": wr["n_tokens"],
                 "_sample_group": ("correct" if correct == 1 else "wrong") if correct is not None else "unknown",
                 "_sample_correct": correct,
+                # model's own predicted label for the sample: 1=abnormal(Yes), 0=normal(No)
+                "_sample_pred": (int(rec["answer"]) if rec.get("answer") is not None else None),
             }
             for k in ("spearman", "dice", "point", "mass_gt",
                       "null_spearman", "null_dice", "null_point", "null_mass_gt"):
@@ -997,15 +1119,19 @@ def main():
 
     # ---- t-SNE ----
     tsne_stats = {"enabled": False}
+    per_class_tsne_stats = {"enabled": False}
     if X_list and tsne_rows and args.tsne_max != 0:
         X = np.stack(X_list, axis=0).astype(np.float32)
         if X.shape[0] != len(tsne_rows):
             raise RuntimeError(f"t-SNE row misalignment: X={X.shape[0]} rows={len(tsne_rows)}")
         tsne_stats = run_tsne_and_stats(tsne_rows, X, args.out, args)
+        # one t-SNE per class, colored by sample correctness / predicted normal-abnormal
+        per_class_tsne_stats = run_per_class_outcome_tsne(tsne_rows, X, args.out, args)
 
     # ---- write outputs ----
     summary = build_summary(all_rows, per_sample, errors)
     summary["tsne"] = tsne_stats
+    summary["tsne_per_class"] = per_class_tsne_stats
     report = {
         "meta": {
             "model_path": args.model_path,
