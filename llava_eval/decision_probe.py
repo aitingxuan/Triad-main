@@ -136,6 +136,222 @@ def _metrics(counts: Dict[str, int]) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
+# Representation-level DIRECTION analysis (evidence vs verbalizer vs bias)
+# ---------------------------------------------------------------------------
+def _unit(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-12 else v
+
+
+def _rankdata(a: np.ndarray) -> np.ndarray:
+    """Average ranks (handles ties), scipy-free."""
+    a = np.asarray(a, dtype=np.float64)
+    order = a.argsort(kind="mergesort")
+    sa = a[order]
+    ranks = np.empty(a.size, dtype=np.float64)
+    i = 0
+    while i < a.size:
+        j = i
+        while j + 1 < a.size and sa[j + 1] == sa[i]:
+            j += 1
+        ranks[order[i:j + 1]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    return ranks
+
+
+def _auc(y: np.ndarray, s: np.ndarray) -> Optional[float]:
+    y = np.asarray(y).astype(int)
+    s = np.asarray(s, dtype=np.float64)
+    n1 = int(y.sum())
+    n0 = int(y.size - n1)
+    if n1 == 0 or n0 == 0:
+        return None
+    r = _rankdata(s)
+    return float((r[y == 1].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
+
+
+def _tnr_at_recall(y: np.ndarray, s: np.ndarray, rec_target: float = 0.95) -> Tuple[Optional[float], Optional[float]]:
+    """Single global Neyman-Pearson operating point: threshold so recall >= rec_target, return TNR."""
+    y = np.asarray(y).astype(int)
+    s = np.asarray(s, dtype=np.float64)
+    pos = s[y == 1]
+    if pos.size == 0:
+        return None, None
+    thr = float(np.quantile(pos, 1.0 - rec_target))
+    pred = (s >= thr).astype(int)
+    tn = int(((pred == 0) & (y == 0)).sum())
+    fp = int(((pred == 1) & (y == 0)).sum())
+    tnr = (tn / (tn + fp)) if (tn + fp) > 0 else None
+    return tnr, thr
+
+
+def direction_analysis(feat_rows: List[dict], d_verb: np.ndarray, rec_target: float = 0.95) -> Dict[str, Any]:
+    """Decompose the Yes/No decision in representation space.
+
+    Directions (all in the decision-token hidden space that ``lm_head`` reads):
+      d_verb : lm_head[A] - lm_head[B]  (the model's verbalizer readout direction)
+      w_ev   : mean_c( mean_defect_c - mean_normal_c )  (evidence direction, class-centered)
+      w_bias : mean_c( mean_normal&FP_c - mean_normal&TN_c )  (what pushes normals to Yes)
+    Reports cosines (global + per-class), variance decomposition of the verbalizer score
+    into evidence vs off-evidence parts, AUC/TNR of four readouts, and a leave-one-class-out
+    zero-shot transfer AUC of the shared evidence direction.
+    """
+    out: Dict[str, Any] = {"enabled": False}
+    if not feat_rows:
+        out["reason"] = "no dec features"
+        return out
+    d_verb = np.asarray(d_verb, dtype=np.float64)
+    X = np.stack([np.asarray(r["X"], dtype=np.float64) for r in feat_rows], 0)
+    if X.shape[1] != d_verb.shape[0]:
+        out["reason"] = f"feature dim {X.shape[1]} != d_verb dim {d_verb.shape[0]}"
+        return out
+    y = np.array([int(r["gt"]) for r in feat_rows])
+    sub = np.array([str(r["subset"]) for r in feat_rows])
+    cell = np.array([str(r.get("cell", "")) for r in feat_rows])
+    margin = np.array(
+        [r.get("margin") if r.get("margin") is not None else np.nan for r in feat_rows],
+        dtype=np.float64,
+    )
+    classes = sorted(set(sub.tolist()))
+
+    mu_norm: Dict[str, np.ndarray] = {}
+    mu_def: Dict[str, np.ndarray] = {}
+    for c in classes:
+        m = sub == c
+        xn = X[m & (y == 0)]
+        xd = X[m & (y == 1)]
+        if xn.shape[0]:
+            mu_norm[c] = xn.mean(0)
+        if xd.shape[0]:
+            mu_def[c] = xd.mean(0)
+
+    diffs = [mu_def[c] - mu_norm[c] for c in classes if c in mu_def and c in mu_norm]
+    w_ev = np.mean(diffs, 0) if diffs else np.zeros(X.shape[1])
+    w_ev_hat = _unit(w_ev)
+
+    is_fp = cell == "FP"
+    is_tn = cell == "TN"
+    bias_diffs = []
+    for c in classes:
+        m = sub == c
+        xf = X[m & is_fp]
+        xt = X[m & is_tn]
+        if xf.shape[0] and xt.shape[0]:
+            bias_diffs.append(xf.mean(0) - xt.mean(0))
+    w_bias = np.mean(bias_diffs, 0) if bias_diffs else np.zeros(X.shape[1])
+    w_bias_hat = _unit(w_bias)
+
+    dvh = _unit(d_verb)
+    cos = {
+        "dverb_ev": float(dvh @ w_ev_hat) if np.any(w_ev) else None,
+        "dverb_bias": float(dvh @ w_bias_hat) if np.any(w_bias) else None,
+        "ev_bias": float(w_ev_hat @ w_bias_hat) if np.any(w_ev) and np.any(w_bias) else None,
+    }
+
+    # Sanity: does <h, d_verb> reproduce the model's stored logit margin?
+    corr = None
+    if int(np.isfinite(margin).sum()) > 3:
+        mask = np.isfinite(margin)
+        a = X[mask] @ d_verb
+        if a.std() > 0 and margin[mask].std() > 0:
+            corr = float(np.corrcoef(a, margin[mask])[0, 1])
+
+    if mu_norm:
+        gnorm = np.mean(list(mu_norm.values()), 0)
+    else:
+        gnorm = np.zeros(X.shape[1])
+    per_class = []
+    for c in classes:
+        row: Dict[str, Any] = {"subset": c}
+        if c in mu_def and c in mu_norm:
+            wev_c = _unit(mu_def[c] - mu_norm[c])
+            row["cos_dverb_ev_c"] = float(dvh @ wev_c)
+        if c in mu_norm:
+            v = mu_norm[c] - gnorm
+            row["norm_centroid_on_ev"] = float(v @ w_ev_hat) if np.any(w_ev) else None
+            row["norm_centroid_on_bias"] = float(v @ w_bias_hat) if np.any(w_bias) else None
+        per_class.append(row)
+
+    # Variance decomposition of the verbalizer score into evidence vs off-evidence parts.
+    a_ev = float(dvh @ w_ev_hat) if np.any(w_ev) else 0.0
+    d_along = a_ev * w_ev_hat
+    d_perp = dvh - d_along
+    s_verb = X @ d_verb
+    s_along = X @ d_along
+    s_perp = X @ d_perp
+
+    def _var(x):
+        return float(np.var(x)) if x.size else None
+
+    def _mean_where(arr, sel):
+        return float(arr[sel].mean()) if int(sel.sum()) else None
+
+    norm_mask = y == 0
+    var_decomp = {
+        "var_s_verb": _var(s_verb),
+        "var_evidence_part": _var(s_along),
+        "var_offev_part": _var(s_perp),
+        "frac_var_from_evidence": (
+            float(np.var(s_along) / (np.var(s_verb) + 1e-12)) if np.var(s_verb) > 0 else None
+        ),
+        "normals_mean_evidence_part": _mean_where(s_along, norm_mask),
+        "normals_mean_offev_part": _mean_where(s_perp, norm_mask),
+        "FP_mean_evidence_part": _mean_where(s_along, is_fp),
+        "TN_mean_evidence_part": _mean_where(s_along, is_tn),
+        "FP_mean_offev_part": _mean_where(s_perp, is_fp),
+        "TN_mean_offev_part": _mean_where(s_perp, is_tn),
+    }
+
+    d_debias = dvh - (float(dvh @ w_bias_hat) * w_bias_hat if np.any(w_bias) else 0.0)
+    w_ev_debias = _unit(
+        w_ev_hat - (float(w_ev_hat @ w_bias_hat) * w_bias_hat if np.any(w_bias) else 0.0)
+    )
+    readout_scores = {
+        "verbalizer": s_verb,
+        "evidence_supervised": X @ w_ev_hat,
+        "verbalizer_minus_bias": X @ d_debias,
+        "evidence_minus_bias": X @ w_ev_debias,
+    }
+    readouts: Dict[str, Any] = {}
+    for name, s in readout_scores.items():
+        tnr, thr = _tnr_at_recall(y, s, rec_target)
+        readouts[name] = {"auc": _auc(y, s), "tnr_at_recall": tnr, "thr": thr}
+
+    # Cross-class zero-shot: leave-one-class-out shared evidence direction.
+    loo = []
+    for c in classes:
+        others = [cc for cc in classes if cc != c and cc in mu_def and cc in mu_norm]
+        m = sub == c
+        Xc = X[m]
+        yc = y[m]
+        if not others or int(yc.sum()) == 0 or int((1 - yc).sum()) == 0:
+            loo.append({"subset": c, "skipped": "single_class_or_no_others"})
+            continue
+        w_loo = _unit(np.mean([mu_def[cc] - mu_norm[cc] for cc in others], 0))
+        Xc_c = Xc - Xc.mean(0)  # label-free centering by the held-out class mean
+        loo.append({"subset": c, "n": int(m.sum()), "auc_zeroshot": _auc(yc, Xc_c @ w_loo)})
+    loo_aucs = [r["auc_zeroshot"] for r in loo if r.get("auc_zeroshot") is not None]
+
+    out.update({
+        "enabled": True,
+        "n": int(X.shape[0]),
+        "hidden_dim": int(X.shape[1]),
+        "cosines": cos,
+        "decision_sanity_corr_score_vs_margin": corr,
+        "per_class": per_class,
+        "variance_decomposition": var_decomp,
+        "readouts": readouts,
+        "rec_target": float(rec_target),
+        "cross_class_zeroshot": {
+            "mean_auc": (float(np.mean(loo_aucs)) if loo_aucs else None),
+            "per_class": loo,
+        },
+    })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Model: one forward -> P(Yes) + hidden features (decision token / visual pool)
 # ---------------------------------------------------------------------------
 @torch.inference_mode()
@@ -475,6 +691,7 @@ def main():
     # ---- Build rows: either from an existing ans JSON, or by running the model ----
     rows: List[dict] = []
     feat_store: Dict[str, List[dict]] = defaultdict(list)
+    d_verb: Optional[np.ndarray] = None
     meta: Dict[str, Any] = {
         "ds": args.ds,
         "text_src": args.text_src,
@@ -539,6 +756,17 @@ def main():
         print(f"A/B token ids: {ab_ids}")
         meta["ab_token_ids"] = ab_ids
 
+        # Verbalizer direction in hidden space: lm_head[A] - lm_head[B] (the readout axis).
+        try:
+            lm_head = worker.model.model.lm_head
+            W = lm_head.weight.detach().float().cpu().numpy()
+            d_verb = W[ab_ids["A"]].mean(0) - W[ab_ids["B"]].mean(0)
+            print(f"verbalizer d_verb: shape={tuple(d_verb.shape)} "
+                  f"norm={float(np.linalg.norm(d_verb)):.4f}")
+        except Exception as e:
+            print(f"[decision-probe] could not build d_verb from lm_head: {repr(e)}")
+            d_verb = None
+
         want_feats = args.feature not in ("none",)
 
         try:
@@ -579,7 +807,7 @@ def main():
             for k, v in scored.get("feats", {}).items():
                 feat_store[k].append({
                     "id": row["id"], "subset": subset, "gt": gt,
-                    "p_A": p_a, "cell": cell, "X": v,
+                    "p_A": p_a, "cell": cell, "margin": scored.get("margin"), "X": v,
                 })
 
     # keep decided rows only (consistent with analysis)
@@ -593,6 +821,17 @@ def main():
     for name, frs in feat_store.items():
         if frs:
             probes[name] = probe_analysis(frs, name, C=args.probe_C, cv=args.probe_cv)
+
+    # ---- Representation-level direction / mechanism analysis (needs dec features + d_verb) ----
+    direction: Dict[str, Any]
+    if feat_store and feat_store.get("dec") and d_verb is not None:
+        direction = direction_analysis(feat_store["dec"], d_verb)
+    elif feat_store:
+        direction = {"enabled": False,
+                     "reason": "dec feature / lm_head direction unavailable; "
+                               "run with --feature dec (or dec+vis) and --model-path"}
+    else:
+        direction = {"enabled": False, "reason": "no features (e.g. --ans / --feature none)"}
 
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -612,6 +851,7 @@ def main():
         "distribution": distribution,
         "capture": capture,
         "probe": probes,
+        "direction": direction,
     }
     if not args.no_rows:
         payload["rows"] = rows
@@ -687,6 +927,39 @@ def main():
                     ])
         print(f"wrote {probe_csv}")
 
+    # ---- CSV: direction / mechanism ----
+    if direction and direction.get("enabled"):
+        dir_csv = csv_prefix + "_direction_readouts.csv"
+        with open(dir_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            c = direction["cosines"]
+            w.writerow(["cos_dverb_ev", "cos_dverb_bias", "cos_ev_bias",
+                        "sanity_corr_score_vs_margin", "frac_var_from_evidence",
+                        "cross_class_zeroshot_mean_auc"])
+            w.writerow([c.get("dverb_ev"), c.get("dverb_bias"), c.get("ev_bias"),
+                        direction.get("decision_sanity_corr_score_vs_margin"),
+                        direction["variance_decomposition"].get("frac_var_from_evidence"),
+                        direction["cross_class_zeroshot"].get("mean_auc")])
+            w.writerow([])
+            w.writerow(["readout", "auc", "tnr_at_recall", "threshold"])
+            for name in ("verbalizer", "evidence_supervised", "verbalizer_minus_bias", "evidence_minus_bias"):
+                r = direction["readouts"].get(name, {})
+                w.writerow([name, r.get("auc"), r.get("tnr_at_recall"), r.get("thr")])
+        print(f"wrote {dir_csv}")
+
+        pc_csv = csv_prefix + "_direction_perclass.csv"
+        zs = {r["subset"]: r for r in direction["cross_class_zeroshot"]["per_class"]}
+        with open(pc_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["subset", "cos_dverb_ev_c", "norm_centroid_on_ev",
+                        "norm_centroid_on_bias", "zeroshot_loo_auc"])
+            for row in direction["per_class"]:
+                z = zs.get(row["subset"], {})
+                w.writerow([row.get("subset"), row.get("cos_dverb_ev_c"),
+                            row.get("norm_centroid_on_ev"), row.get("norm_centroid_on_bias"),
+                            z.get("auc_zeroshot")])
+        print(f"wrote {pc_csv}")
+
     # ---- optional features dump ----
     if args.save_feats and feat_store:
         npz_path = os.path.splitext(out_path)[0] + "_features.npz"
@@ -695,14 +968,60 @@ def main():
             dump[f"X_{name}"] = np.stack([r["X"] for r in frs], axis=0)
             dump[f"gt_{name}"] = np.array([int(r["gt"]) for r in frs])
             dump[f"subset_{name}"] = np.array([str(r["subset"]) for r in frs])
+            dump[f"cell_{name}"] = np.array([str(r.get("cell", "")) for r in frs])
+        if d_verb is not None:
+            dump["d_verb"] = np.asarray(d_verb, dtype=np.float32)
         np.savez_compressed(npz_path, **dump)
         print(f"wrote {npz_path}")
 
     # ---- console verdict ----
-    _print_verdict(distribution, capture, probes)
+    _print_verdict(distribution, capture, probes, direction)
 
 
-def _print_verdict(distribution, capture, probes):
+def _print_direction(direction: Dict[str, Any]) -> None:
+    if not direction or not direction.get("enabled"):
+        reason = direction.get("reason") if direction else "not run"
+        print(f"\n[DIRECTION] disabled ({reason})")
+        return
+    c = direction["cosines"]
+    print("\n---------------- DIRECTION / MECHANISM ----------------")
+    print(f"n={direction['n']} hidden_dim={direction['hidden_dim']}  "
+          f"cos(d_verb,w_ev)={_fmt(c.get('dverb_ev'))}  "
+          f"cos(d_verb,w_bias)={_fmt(c.get('dverb_bias'))}  "
+          f"cos(w_ev,w_bias)={_fmt(c.get('ev_bias'))}")
+    print(f"decision sanity corr(<h,d_verb>, margin)="
+          f"{_fmt(direction.get('decision_sanity_corr_score_vs_margin'))}")
+    ro = direction["readouts"]
+    rt = direction["rec_target"]
+    for name in ("verbalizer", "evidence_supervised", "verbalizer_minus_bias", "evidence_minus_bias"):
+        r = ro.get(name, {})
+        print(f"  readout {name:22s}: AUC={_fmt(r.get('auc'))}  "
+              f"TNR@recall{rt:.2f}={_fmt(r.get('tnr_at_recall'))}")
+    vd = direction["variance_decomposition"]
+    print(f"  normals: evidence-part={_fmt(vd.get('normals_mean_evidence_part'))}  "
+          f"off-evidence-part={_fmt(vd.get('normals_mean_offev_part'))}  "
+          f"(frac var from evidence={_fmt(vd.get('frac_var_from_evidence'))})")
+    print(f"  FP off-ev={_fmt(vd.get('FP_mean_offev_part'))}  TN off-ev={_fmt(vd.get('TN_mean_offev_part'))}")
+    cc = direction["cross_class_zeroshot"]
+    print(f"  cross-class zero-shot LOO mean AUC={_fmt(cc.get('mean_auc'))}")
+    dvh_ev = c.get("dverb_ev")
+    dvh_bias = c.get("dverb_bias")
+    if dvh_ev is not None and dvh_bias is not None:
+        if dvh_bias > dvh_ev:
+            print("  => verbalizer aligns MORE with the bias direction than evidence: "
+                  "the Yes/No readout is prior-driven.")
+        else:
+            print("  => verbalizer aligns more with evidence than bias (readout mostly evidence-driven).")
+    if cc.get("mean_auc") is not None:
+        if cc["mean_auc"] >= 0.90:
+            print("  => a SHARED evidence direction transfers to held-out classes: "
+                  "a class-invariant anomaly direction exists.")
+        else:
+            print("  => shared-direction transfer is weak; the anomaly representation is partly class-specific.")
+    print("-------------------------------------------------------\n")
+
+
+def _print_verdict(distribution, capture, probes, direction):
     print("\n================ VERDICT ================")
     a = distribution["all"]
     m = a["metrics"]; c = a["counts"]
@@ -753,6 +1072,8 @@ def _print_verdict(distribution, capture, probes):
                       "(need new signal: AD score etc.).")
             else:
                 print("  => probe ~ LM: the LM decision is roughly as good as a linear readout of features.")
+
+    _print_direction(direction)
     print("========================================\n")
 
 
