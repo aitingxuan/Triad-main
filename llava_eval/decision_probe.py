@@ -186,6 +186,218 @@ def _tnr_at_recall(y: np.ndarray, s: np.ndarray, rec_target: float = 0.95) -> Tu
     return tnr, thr
 
 
+def _randomized_range(R: np.ndarray, k: int, seed: int = 0, n_iter: int = 1) -> np.ndarray:
+    """Orthonormal basis (N x k) approximating the range of R (N x H), for H >> k."""
+    N, H = R.shape
+    k = int(min(k, max(N - 1, 1), H))
+    rng = np.random.default_rng(seed)
+    omega = rng.standard_normal((H, k))
+    Y = R @ omega
+    for _ in range(max(0, n_iter)):
+        Y = R @ (R.T @ Y)
+    Q, _ = np.linalg.qr(Y)
+    return Q[:, :k]
+
+
+def _metrics_from_pred(pred: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+    pred = np.asarray(pred).astype(int)
+    y = np.asarray(y).astype(int)
+    tp = int(((pred == 1) & (y == 1)).sum())
+    fp = int(((pred == 1) & (y == 0)).sum())
+    tn = int(((pred == 0) & (y == 0)).sum())
+    fn = int(((pred == 0) & (y == 1)).sum())
+    eps = 1e-9
+    return {"acc": (tp + tn) / (y.size + eps), "rec": tp / (tp + fn + eps),
+            "tnr": tn / (tn + fp + eps), "tp": tp, "fp": fp, "tn": tn, "fn": fn}
+
+
+def _per_class_intercept(s: np.ndarray, sub: np.ndarray, y: np.ndarray, classes) -> Dict[str, float]:
+    """Per-class threshold = midpoint of the class's normal/defect medians of the score."""
+    b: Dict[str, float] = {}
+    for c in classes:
+        m = sub == c
+        sn = s[m & (y == 0)]
+        sd = s[m & (y == 1)]
+        if sn.size and sd.size:
+            b[c] = float(0.5 * (np.median(sn) + np.median(sd)))
+        elif sn.size:
+            b[c] = float(np.median(sn))
+        elif sd.size:
+            b[c] = float(np.median(sd))
+    return b
+
+
+def _predict_with_b(s: np.ndarray, sub: np.ndarray, b: Dict[str, float]) -> np.ndarray:
+    barr = np.array([b.get(str(sc), np.inf) for sc in sub], dtype=np.float64)
+    return (s > barr).astype(int)
+
+
+def _cv_intercept_oof(s: np.ndarray, sub: np.ndarray, y: np.ndarray, classes, K: int, seed: int) -> np.ndarray:
+    """Out-of-fold per-class-intercept predictions (K-fold within each class)."""
+    rng = np.random.default_rng(seed)
+    pred = np.full(s.size, -1, dtype=int)
+    K = max(int(K), 2)
+    for c in classes:
+        idx = np.where(sub == c)[0]
+        if idx.size < 2:
+            continue
+        fold = np.zeros(idx.size, dtype=int)
+        for g in (0, 1):
+            pos = np.where(y[idx] == g)[0]
+            if pos.size:
+                rng.shuffle(pos)
+                fold[pos] = np.arange(pos.size) % K
+        for f in range(K):
+            te = idx[fold == f]
+            tr = idx[fold != f]
+            if te.size == 0 or tr.size == 0:
+                continue
+            sn = s[tr][y[tr] == 0]
+            sd = s[tr][y[tr] == 1]
+            if sn.size and sd.size:
+                bt = 0.5 * (np.median(sn) + np.median(sd))
+            elif sn.size:
+                bt = float(np.median(sn))
+            elif sd.size:
+                bt = float(np.median(sd))
+            else:
+                continue
+            pred[te] = (s[te] > bt).astype(int)
+    if (pred < 0).any():
+        b_all = _per_class_intercept(s, sub, y, classes)
+        miss = pred < 0
+        barr = np.array([b_all.get(str(sc), np.inf) for sc in sub[miss]], dtype=np.float64)
+        pred[miss] = (s[miss] > barr).astype(int)
+    return pred
+
+
+def shared_model_analysis(feat_rows: List[dict], ridge: float = 0.05, cv: int = 5,
+                          seed: int = 0, k_white: int = 128) -> Dict[str, Any]:
+    """Class-invariant anomaly direction with whitening + shared-w / per-class-intercept model.
+
+    Directions (all class-invariant, estimated from normal/defect centroids):
+      ev   : mean_c(mu_def_c - mu_norm_c)                       (raw mean-diff)
+      diag : ev divided by per-dim within-cell variance          (diagonal Mahalanobis)
+      lda  : (Sigma_w + ridge*I)^-1 ev, via low-rank randomized whitening (Mahalanobis)
+    For each direction we report in-sample AUC and leave-one-class-out zero-shot AUC.
+    Then a "shared w + per-class intercept b_c" model (score = <h,w> > b_c) is evaluated
+    in-sample (ceiling) and with within-class K-fold CV on b_c (honest-ish).
+    """
+    out: Dict[str, Any] = {"enabled": False}
+    if not feat_rows:
+        out["reason"] = "no dec features"
+        return out
+    X = np.stack([np.asarray(r["X"], dtype=np.float64) for r in feat_rows], 0)
+    y = np.array([int(r["gt"]) for r in feat_rows])
+    sub = np.array([str(r["subset"]) for r in feat_rows])
+    classes = sorted(set(sub.tolist()))
+    N, H = X.shape
+
+    gm: Dict[Any, np.ndarray] = {}
+    for c in classes:
+        for g in (0, 1):
+            m = (sub == c) & (y == g)
+            if m.sum():
+                gm[(c, g)] = X[m].mean(0)
+    d_by_class = {c: gm[(c, 1)] - gm[(c, 0)] for c in classes if (c, 1) in gm and (c, 0) in gm}
+    if not d_by_class:
+        out["reason"] = "need both normal & defect per class"
+        return out
+    d_global = np.mean(list(d_by_class.values()), 0)
+
+    gmean = np.empty_like(X)
+    for i in range(N):
+        gmean[i] = gm[(sub[i], int(y[i]))]
+    R = X - gmean
+    ss_dim = (R * R).sum(0)                     # per-dim sum of squared residuals
+    denom = max(N - 1, 1)
+    var_w = ss_dim / denom
+    trace_C = float(ss_dim.sum() / denom)
+    lam = max(ridge * trace_C / H, 1e-12)
+    lam_d = max(ridge * float(var_w.mean()), 1e-12)
+    ss_by_class = {c: (R[sub == c] ** 2).sum(0) for c in classes}
+    n_class = {c: int((sub == c).sum()) for c in classes}
+
+    w_ev = _unit(d_global)
+    w_diag = _unit(d_global / (var_w + lam_d))
+
+    lda_ok = True
+    try:
+        Q = _randomized_range(R, k_white, seed=seed)
+        Bc = (Q.T @ R) / np.sqrt(denom)         # k x H;  Bc^T Bc ~ R^T R/(N-1)
+        M = Bc @ Bc.T + lam * np.eye(Bc.shape[0])
+
+        def _whiten(d):
+            Bd = Bc @ d
+            yv = np.linalg.solve(M, Bd)
+            return (d - Bc.T @ yv) / lam
+        w_lda = _unit(_whiten(d_global))
+    except Exception as e:  # noqa: BLE001
+        lda_ok = False
+        out["lda_error"] = repr(e)
+        _whiten = None
+        w_lda = _unit(d_global)
+
+    def _auc_of(w):
+        return _auc(y, X @ w)
+
+    def _zs(direction_fn):
+        vals = []
+        for c in classes:
+            others = [cc for cc in classes if cc != c and cc in d_by_class]
+            m = sub == c
+            Xc = X[m]
+            yc = y[m]
+            if not others or int(yc.sum()) == 0 or int((1 - yc).sum()) == 0:
+                continue
+            d_o = np.mean([d_by_class[cc] for cc in others], 0)
+            try:
+                w = _unit(direction_fn(d_o, c))
+            except Exception:  # noqa: BLE001
+                continue
+            vals.append(_auc(yc, (Xc - Xc.mean(0)) @ w))
+        return float(np.mean(vals)) if vals else None
+
+    def _dir_diag_loo(d, c):
+        den = max((N - n_class[c]) - 1, 1)
+        var_o = (ss_dim - ss_by_class[c]) / den
+        return d / (var_o + lam_d)
+
+    zs_ev = _zs(lambda d, c: d)
+    zs_diag = _zs(_dir_diag_loo)
+    zs_lda = _zs(lambda d, c: _whiten(d)) if lda_ok else None
+
+    def _intercept_model(w):
+        s = X @ w
+        b = _per_class_intercept(s, sub, y, classes)
+        pred_in = _predict_with_b(s, sub, b)
+        pred_cv = _cv_intercept_oof(s, sub, y, classes, cv, seed)
+        per = {}
+        for c in classes:
+            m = sub == c
+            per[c] = {"b": b.get(c),
+                      "in": _metrics_from_pred(pred_in[m], y[m]),
+                      "cv": _metrics_from_pred(pred_cv[m], y[m])}
+        return {"in_sample": _metrics_from_pred(pred_in, y),
+                "cv": _metrics_from_pred(pred_cv, y),
+                "per_class": per}
+
+    intercept = {"ev": _intercept_model(w_ev), "lda": _intercept_model(w_lda)}
+
+    out.update({
+        "enabled": True, "n": int(N), "hidden_dim": int(H),
+        "ridge": float(ridge), "cv": int(cv), "k_white": int(min(k_white, max(N - 1, 1), H)),
+        "lda_ok": bool(lda_ok),
+        "directions": {
+            "ev": {"in_sample_auc": _auc_of(w_ev), "zeroshot_auc": zs_ev},
+            "diag": {"in_sample_auc": _auc_of(w_diag), "zeroshot_auc": zs_diag},
+            "lda": {"in_sample_auc": _auc_of(w_lda), "zeroshot_auc": zs_lda},
+        },
+        "intercept": intercept,
+    })
+    return out
+
+
 def direction_analysis(feat_rows: List[dict], d_verb: np.ndarray, rec_target: float = 0.95) -> Dict[str, Any]:
     """Decompose the Yes/No decision in representation space.
 
@@ -833,6 +1045,13 @@ def main():
     else:
         direction = {"enabled": False, "reason": "no features (e.g. --ans / --feature none)"}
 
+    # ---- Shared whitened direction + per-class-intercept model (needs dec features) ----
+    shared: Dict[str, Any]
+    if feat_store and feat_store.get("dec"):
+        shared = shared_model_analysis(feat_store["dec"], ridge=0.05, cv=5, seed=args.seed)
+    else:
+        shared = {"enabled": False, "reason": "no dec features (need --feature dec and model mode)"}
+
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     png_path = os.path.splitext(out_path)[0] + "_pA_by_cell.png"
@@ -852,6 +1071,7 @@ def main():
         "capture": capture,
         "probe": probes,
         "direction": direction,
+        "shared_model": shared,
     }
     if not args.no_rows:
         payload["rows"] = rows
@@ -960,6 +1180,37 @@ def main():
                             z.get("auc_zeroshot")])
         print(f"wrote {pc_csv}")
 
+    # ---- CSV: shared whitened direction + per-class-intercept model ----
+    if shared and shared.get("enabled"):
+        sh_csv = csv_prefix + "_shared_model.csv"
+        with open(sh_csv, "w", newline="", encoding="utf-8") as f:
+            wcsv = csv.writer(f)
+            wcsv.writerow(["kind", "name", "in_sample_auc", "zeroshot_auc",
+                           "is_acc", "is_rec", "is_tnr", "cv_acc", "cv_rec", "cv_tnr"])
+            for name in ("ev", "diag", "lda"):
+                r = shared["directions"].get(name, {})
+                wcsv.writerow(["direction", name, r.get("in_sample_auc"),
+                               r.get("zeroshot_auc"), None, None, None, None, None, None])
+            for key in ("lda", "ev"):
+                im = shared["intercept"][key]
+                ins = im["in_sample"]; cvs = im["cv"]
+                wcsv.writerow(["intercept", key, None, None,
+                               ins["acc"], ins["rec"], ins["tnr"],
+                               cvs["acc"], cvs["rec"], cvs["tnr"]])
+        print(f"wrote {sh_csv}")
+
+        spc_csv = csv_prefix + "_shared_perclass.csv"
+        with open(spc_csv, "w", newline="", encoding="utf-8") as f:
+            wcsv = csv.writer(f)
+            wcsv.writerow(["subset", "b_lda", "in_rec_lda", "in_tnr_lda",
+                           "cv_rec_lda", "cv_tnr_lda"])
+            per = shared["intercept"]["lda"]["per_class"]
+            for c in sorted(per.keys()):
+                p = per[c]
+                wcsv.writerow([c, p.get("b"), p["in"]["rec"], p["in"]["tnr"],
+                               p["cv"]["rec"], p["cv"]["tnr"]])
+        print(f"wrote {spc_csv}")
+
     # ---- optional features dump ----
     if args.save_feats and feat_store:
         npz_path = os.path.splitext(out_path)[0] + "_features.npz"
@@ -975,7 +1226,7 @@ def main():
         print(f"wrote {npz_path}")
 
     # ---- console verdict ----
-    _print_verdict(distribution, capture, probes, direction)
+    _print_verdict(distribution, capture, probes, direction, shared)
 
 
 def _print_direction(direction: Dict[str, Any]) -> None:
@@ -1021,7 +1272,35 @@ def _print_direction(direction: Dict[str, Any]) -> None:
     print("-------------------------------------------------------\n")
 
 
-def _print_verdict(distribution, capture, probes, direction):
+def _print_shared(shared: Dict[str, Any]) -> None:
+    if not shared or not shared.get("enabled"):
+        reason = shared.get("reason") if shared else "not run"
+        print(f"\n[SHARED-MODEL] disabled ({reason})")
+        return
+    d = shared["directions"]
+    print("\n----------- SHARED DIRECTION / WHITENED MODEL -----------")
+    for name in ("ev", "diag", "lda"):
+        r = d.get(name, {})
+        print(f"  dir {name:5s}: in-sample AUC={_fmt(r.get('in_sample_auc'))}  "
+              f"zero-shot LOO AUC={_fmt(r.get('zeroshot_auc'))}")
+    if not shared.get("lda_ok"):
+        print(f"  (LDA whitening failed -> fell back to mean-diff: {shared.get('lda_error')})")
+    print(f"  whitening: ridge={shared['ridge']}  k={shared['k_white']}  "
+          f"hidden_dim={shared['hidden_dim']}")
+    for key, label in (("lda", "w_lda + per-class intercept"),
+                       ("ev", "w_ev  + per-class intercept")):
+        im = shared["intercept"][key]
+        ins = im["in_sample"]; cvs = im["cv"]
+        print(f"  [{label}]")
+        print(f"     in-sample: acc={_fmt(ins['acc'])} rec={_fmt(ins['rec'])} tnr={_fmt(ins['tnr'])} "
+              f"(tp={ins['tp']} fp={ins['fp']} tn={ins['tn']} fn={ins['fn']})")
+        print(f"     CV({shared.get('cv', '?')}):     acc={_fmt(cvs['acc'])} rec={_fmt(cvs['rec'])} "
+              f"tnr={_fmt(cvs['tnr'])}")
+    print("  (reference: deployed 0.5 threshold gave acc~0.916 rec~0.973 tnr~0.760)")
+    print("---------------------------------------------------------\n")
+
+
+def _print_verdict(distribution, capture, probes, direction, shared):
     print("\n================ VERDICT ================")
     a = distribution["all"]
     m = a["metrics"]; c = a["counts"]
@@ -1074,6 +1353,7 @@ def _print_verdict(distribution, capture, probes, direction):
                 print("  => probe ~ LM: the LM decision is roughly as good as a linear readout of features.")
 
     _print_direction(direction)
+    _print_shared(shared)
     print("========================================\n")
 
 
