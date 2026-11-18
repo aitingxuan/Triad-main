@@ -398,6 +398,218 @@ def shared_model_analysis(feat_rows: List[dict], ridge: float = 0.05, cv: int = 
     return out
 
 
+def _cv_proba(X: np.ndarray, y: np.ndarray, C: float = 0.1, cv: int = 5, seed: int = 0):
+    """Out-of-fold P(defect) from a standardized logistic probe; None if sklearn unavailable."""
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import StratifiedKFold, cross_val_predict
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+    except Exception:  # noqa: BLE001
+        return None
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y).astype(int)
+    n1 = int(y.sum())
+    n0 = int(y.size - n1)
+    if n1 == 0 or n0 == 0:
+        return None
+    k = int(min(cv, n1, n0))
+    try:
+        clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, C=C))
+        if k < 2:
+            clf.fit(X, y)
+            return clf.predict_proba(X)[:, 1]
+        skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+        return cross_val_predict(clf, X, y, cv=skf, method="predict_proba")[:, 1]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def axis_residual_diagnostics(feat_rows: List[dict], C: float = 0.1, cv: int = 5,
+                              seed: int = 0, n_bins: int = 10) -> Dict[str, Any]:
+    """D2: is there normal/defect signal OFF the shared evidence axis? (residual probe + binned AUC)
+
+    Projects out the shared mean-diff axis w_ev, then:
+      - runs a linear probe on the OFF-AXIS residual (does separation survive off-axis?),
+      - bins samples by axis score t=<h,w_ev> and reports within-bin residual AUC
+        (can same-axis samples still be separated by their off-axis residual?).
+    """
+    out: Dict[str, Any] = {"enabled": False}
+    if not feat_rows:
+        out["reason"] = "no dec features"
+        return out
+    X = np.stack([np.asarray(r["X"], dtype=np.float64) for r in feat_rows], 0)
+    y = np.array([int(r["gt"]) for r in feat_rows])
+    sub = np.array([str(r["subset"]) for r in feat_rows])
+    classes = sorted(set(sub.tolist()))
+    N, H = X.shape
+
+    mu_norm: Dict[str, np.ndarray] = {}
+    mu_def: Dict[str, np.ndarray] = {}
+    for c in classes:
+        m = sub == c
+        xn = X[m & (y == 0)]
+        xd = X[m & (y == 1)]
+        if xn.shape[0]:
+            mu_norm[c] = xn.mean(0)
+        if xd.shape[0]:
+            mu_def[c] = xd.mean(0)
+    d_by_class = {c: mu_def[c] - mu_norm[c] for c in classes if c in mu_def and c in mu_norm}
+    if not d_by_class:
+        out["reason"] = "need both labels per class"
+        return out
+    w = _unit(np.mean(list(d_by_class.values()), 0))
+    t = X @ w
+    resid = X - np.outer(t, w)
+
+    full_p = _cv_proba(X, y, C, cv, seed)
+    res_p = _cv_proba(resid, y, C, cv, seed)
+    out.update({
+        "enabled": True, "n": int(N), "hidden_dim": int(H),
+        "full_probe_auc": _auc(y, full_p) if full_p is not None else None,
+        "residual_probe_auc": _auc(y, res_p) if res_p is not None else None,
+    })
+
+    per = []
+    for c in classes:
+        m = sub == c
+        yc = y[m]
+        if int(yc.sum()) and int((1 - yc).sum()):
+            p = _cv_proba(resid[m], yc, C, cv, seed)
+            per.append({"subset": c, "n": int(m.sum()),
+                        "residual_probe_auc": _auc(yc, p) if p is not None else None})
+    out["per_class_residual_auc"] = per
+
+    cond = []
+    if res_p is not None:
+        qs = np.quantile(t, np.linspace(0, 1, n_bins + 1))
+        for b in range(n_bins):
+            lo, hi = float(qs[b]), float(qs[b + 1])
+            m = (t >= lo) & (t <= hi) if b == n_bins - 1 else (t >= lo) & (t < hi)
+            yb = y[m]
+            cond.append({
+                "bin": b, "t_lo": lo, "t_hi": hi, "n": int(m.sum()),
+                "auc_resid_within_bin": (_auc(yb, res_p[m])
+                                         if (int(yb.sum()) and int((1 - yb).sum())) else None),
+            })
+    out["conditional_auc_by_axis_bin"] = cond
+    return out
+
+
+def lowrank_gaussian_diagnostics(feat_rows: List[dict], r_list=(1, 2, 4, 8, 16, 32),
+                                 ridge_cov: float = 1e-2, rho: float = 10.0,
+                                 cv: int = 5, seed: int = 0) -> Dict[str, Any]:
+    """D1+D3: shared-subspace rank spectrum + class-conditional low-rank Gaussian LLR.
+
+    Build shared anomaly basis U_r from SVD of the per-class mean-diff matrix D (H x C).
+    In z=U_r^T h space, fit a class-conditional Gaussian (shrinkage covariance toward the
+    pooled within-cell covariance, estimated from NORMALS-heavy counts) and score with a
+    Gaussian log-likelihood-ratio. Evaluated with within-class K-fold CV (honest-ish).
+    A rank-r 2nd-order readout that beats rank-1 / the 1-D axis indicates the structural win.
+    """
+    out: Dict[str, Any] = {"enabled": False}
+    if not feat_rows:
+        out["reason"] = "no dec features"
+        return out
+    X = np.stack([np.asarray(r["X"], dtype=np.float64) for r in feat_rows], 0)
+    y = np.array([int(r["gt"]) for r in feat_rows])
+    sub = np.array([str(r["subset"]) for r in feat_rows])
+    classes = sorted(set(sub.tolist()))
+    N, H = X.shape
+
+    gm: Dict[Any, np.ndarray] = {}
+    for c in classes:
+        for g in (0, 1):
+            m = (sub == c) & (y == g)
+            if m.sum():
+                gm[(c, g)] = X[m].mean(0)
+    d_by_class = {c: gm[(c, 1)] - gm[(c, 0)] for c in classes if (c, 1) in gm and (c, 0) in gm}
+    if not d_by_class:
+        out["reason"] = "need both labels per class"
+        return out
+    D = np.stack(list(d_by_class.values()), axis=1)  # H x C
+    U, S, _ = np.linalg.svd(D, full_matrices=False)
+    s2 = S ** 2
+    energy = [float(e) for e in (s2 / max(float(s2.sum()), 1e-12))[:min(len(s2), 16)]]
+
+    by_rank = []
+    best = None
+    for r in sorted(set(int(x) for x in r_list)):
+        r = int(min(r, U.shape[1]))
+        if r < 1:
+            continue
+        Ur = U[:, :r]
+        z = X @ Ur
+
+        zc = np.empty_like(z)
+        for i in range(N):
+            zc[i] = gm[(sub[i], int(y[i]))] @ Ur
+        Rz = z - zc
+        Spool = (Rz.T @ Rz) / max(N - len(gm), 1) + ridge_cov * np.eye(r)
+
+        rng = np.random.default_rng(seed)
+        oof = np.full(N, np.nan)
+        for c in classes:
+            idx = np.where(sub == c)[0]
+            if idx.size < 4:
+                continue
+            fold = np.zeros(idx.size, dtype=int)
+            for g in (0, 1):
+                pos = np.where(y[idx] == g)[0]
+                if pos.size:
+                    rng.shuffle(pos)
+                    fold[pos] = np.arange(pos.size) % max(int(cv), 2)
+            for f in range(max(int(cv), 2)):
+                te = idx[fold == f]
+                tr = idx[fold != f]
+                if te.size == 0:
+                    continue
+                mn = z[tr][y[tr] == 0]
+                md = z[tr][y[tr] == 1]
+                if mn.shape[0] < 2 or md.shape[0] < 2:
+                    continue
+                mun = mn.mean(0)
+                mud = md.mean(0)
+                Rn = mn - mun
+                Rd = md - mud
+                Sp = (Rn.T @ Rn + Rd.T @ Rd) / max((mn.shape[0] + md.shape[0] - 2), 1)
+                alpha = rho / (rho + max(mn.shape[0], 1))
+                Sc = (1.0 - alpha) * Sp + alpha * Spool
+                inv = np.linalg.pinv(Sc)
+
+                def _maha(a, mu, inv=inv):
+                    d = a - mu
+                    return np.einsum("ij,jk,ik->i", d, inv, d)
+
+                oof[te] = 0.5 * (_maha(z[te], mun) - _maha(z[te], mud))
+
+        mask = np.isfinite(oof)
+        auc = _auc(y[mask], oof[mask]) if int(mask.sum()) else None
+        tnr, _ = _tnr_at_recall(y[mask], oof[mask], 0.95) if int(mask.sum()) else (None, None)
+        by_rank.append({"r": r, "oof_auc": auc, "tnr_at_recall95": tnr})
+        if auc is not None and (best is None or auc > best["auc"]):
+            best = {"r": r, "auc": auc, "oof": oof.copy()}
+
+    per = []
+    if best is not None:
+        oof = best["oof"]
+        mask = np.isfinite(oof)
+        for c in classes:
+            m = (sub == c) & mask
+            yc = y[m]
+            if int(yc.sum()) and int((1 - yc).sum()):
+                per.append({"subset": c, "n": int(m.sum()), "auc": _auc(yc, oof[m])})
+
+    out.update({
+        "enabled": True, "n": int(N), "hidden_dim": int(H), "n_classes": len(d_by_class),
+        "singular_energy_top": energy,
+        "by_rank": by_rank,
+        "best_r": (best["r"] if best else None),
+        "per_class_auc_best_r": per,
+    })
+    return out
+
+
 def direction_analysis(feat_rows: List[dict], d_verb: np.ndarray, rec_target: float = 0.95) -> Dict[str, Any]:
     """Decompose the Yes/No decision in representation space.
 
@@ -896,7 +1108,14 @@ def main():
                     help="CSV prefix (default: out path without extension)")
     ap.add_argument("--no-rows", action="store_true", help="omit per-sample rows from JSON")
     ap.add_argument("--save-feats", action="store_true", help="save features to <out>.npz")
+    ap.add_argument("--features-npz", type=str, default=None,
+                    help="offline: load a *_features.npz and run ONLY feature-space diagnostics "
+                         "(direction / shared / axis-residual / low-rank Gaussian); CPU only, no model.")
     args = ap.parse_args()
+
+    if args.features_npz:
+        _run_offline_features(args)
+        return
 
     fracs = [float(x) for x in args.bottom_fracs.split(",") if x.strip()]
 
@@ -1052,6 +1271,16 @@ def main():
     else:
         shared = {"enabled": False, "reason": "no dec features (need --feature dec and model mode)"}
 
+    # ---- D2: off-axis residual signal ; D1/D3: shared-subspace rank + low-rank Gaussian ----
+    axis: Dict[str, Any]
+    lowrank: Dict[str, Any]
+    if feat_store and feat_store.get("dec"):
+        axis = axis_residual_diagnostics(feat_store["dec"], C=args.probe_C, cv=args.probe_cv, seed=args.seed)
+        lowrank = lowrank_gaussian_diagnostics(feat_store["dec"], seed=args.seed, cv=args.probe_cv)
+    else:
+        axis = {"enabled": False, "reason": "no dec features"}
+        lowrank = {"enabled": False, "reason": "no dec features"}
+
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     png_path = os.path.splitext(out_path)[0] + "_pA_by_cell.png"
@@ -1072,6 +1301,8 @@ def main():
         "probe": probes,
         "direction": direction,
         "shared_model": shared,
+        "axis_residual": axis,
+        "lowrank_gaussian": lowrank,
     }
     if not args.no_rows:
         payload["rows"] = rows
@@ -1226,7 +1457,7 @@ def main():
         print(f"wrote {npz_path}")
 
     # ---- console verdict ----
-    _print_verdict(distribution, capture, probes, direction, shared)
+    _print_verdict(distribution, capture, probes, direction, shared, axis, lowrank)
 
 
 def _print_direction(direction: Dict[str, Any]) -> None:
@@ -1300,7 +1531,122 @@ def _print_shared(shared: Dict[str, Any]) -> None:
     print("---------------------------------------------------------\n")
 
 
-def _print_verdict(distribution, capture, probes, direction, shared):
+def _print_axis(axis: Dict[str, Any]) -> None:
+    if not axis or not axis.get("enabled"):
+        r = axis.get("reason") if axis else "not run"
+        print(f"\n[AXIS-RESIDUAL] disabled ({r})")
+        return
+    print("\n--------------- AXIS-OFF RESIDUAL (D2) ---------------")
+    print(f"  full-state probe AUC        = {_fmt(axis.get('full_probe_auc'))}")
+    print(f"  OFF-AXIS residual probe AUC = {_fmt(axis.get('residual_probe_auc'))}")
+    per = [p for p in axis.get("per_class_residual_auc", []) if p.get("residual_probe_auc") is not None]
+    if per:
+        per = sorted(per, key=lambda x: x["residual_probe_auc"])
+        print("  per-class residual AUC (worst 6): " +
+              ", ".join(f"{p['subset']}={p['residual_probe_auc']:.3f}" for p in per[:6]))
+    cond = [c for c in axis.get("conditional_auc_by_axis_bin", [])
+            if c.get("auc_resid_within_bin") is not None]
+    if cond:
+        print("  within-axis-bin residual AUC (low->high t deciles): " +
+              ", ".join(f"{c['auc_resid_within_bin']:.2f}" for c in cond))
+    print("  (residual AUC stays high, esp. hard classes & high-t bins => off-axis info exists)")
+    print("------------------------------------------------------\n")
+
+
+def _print_lowrank(lr: Dict[str, Any]) -> None:
+    if not lr or not lr.get("enabled"):
+        r = lr.get("reason") if lr else "not run"
+        print(f"\n[LOWRANK-GAUSS] disabled ({r})")
+        return
+    print("\n------ SHARED-SUBSPACE RANK + 2nd-ORDER GAUSSIAN (D1/D3) ------")
+    spec = lr.get("singular_energy_top", [])
+    if spec:
+        print("  singular energy (top): " + ", ".join(f"{e:.2f}" for e in spec[:8]))
+    for blk in lr.get("by_rank", []):
+        print(f"  r={blk['r']:>2}: OOF AUC={_fmt(blk.get('oof_auc'))}  "
+              f"TNR@recall0.95={_fmt(blk.get('tnr_at_recall95'))}")
+    per = [p for p in lr.get("per_class_auc_best_r", []) if p.get("auc") is not None]
+    if per:
+        per = sorted(per, key=lambda x: x["auc"])
+        print(f"  best_r={lr.get('best_r')} worst-6 per-class AUC: " +
+              ", ".join(f"{p['subset']}={p['auc']:.3f}" for p in per[:6]))
+    print("  (some r>1 beats r=1 and TNR@recall0.95 rises => low-rank 2nd-order readout helps)")
+    print("----------------------------------------------------------------\n")
+
+
+def _run_offline_features(args) -> None:
+    npz = np.load(args.features_npz, allow_pickle=True)
+    key = None
+    for cand in ("dec", "vis"):
+        if f"X_{cand}" in npz:
+            key = cand
+            break
+    if key is None:
+        raise SystemExit("features npz has no X_dec / X_vis array")
+    X = np.asarray(npz[f"X_{key}"])
+    gt = np.asarray(npz[f"gt_{key}"])
+    sub = np.asarray(npz[f"subset_{key}"])
+    cell = np.asarray(npz[f"cell_{key}"]) if f"cell_{key}" in npz else np.array([""] * len(gt))
+    rows = [{"id": int(i), "subset": str(sub[i]), "gt": int(gt[i]), "p_A": None,
+             "cell": str(cell[i]), "margin": None, "X": X[i]} for i in range(len(gt))]
+    d_verb = np.asarray(npz["d_verb"]) if "d_verb" in npz else None
+
+    print(f"[offline] loaded {args.features_npz}  feature={key}  n={len(gt)}  dim={X.shape[1]}")
+    direction = (direction_analysis(rows, d_verb) if d_verb is not None
+                 else {"enabled": False, "reason": "no d_verb in npz"})
+    shared = shared_model_analysis(rows, seed=args.seed)
+    axis = axis_residual_diagnostics(rows, C=args.probe_C, cv=args.probe_cv, seed=args.seed)
+    lowrank = lowrank_gaussian_diagnostics(rows, seed=args.seed, cv=args.probe_cv)
+
+    payload = {
+        "meta": {"mode": "offline_features", "features_npz": args.features_npz,
+                 "feature": key, "n": int(len(gt)), "seed": args.seed},
+        "direction": direction, "shared_model": shared,
+        "axis_residual": axis, "lowrank_gaussian": lowrank,
+    }
+    out_path = args.out
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"wrote {out_path}")
+
+    csv_prefix = args.csv_prefix or os.path.splitext(out_path)[0]
+
+    ar_csv = csv_prefix + "_axis_residual.csv"
+    with open(ar_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["full_probe_auc", axis.get("full_probe_auc")])
+        w.writerow(["residual_probe_auc", axis.get("residual_probe_auc")])
+        w.writerow([])
+        w.writerow(["subset", "n", "residual_probe_auc"])
+        for p in axis.get("per_class_residual_auc", []):
+            w.writerow([p.get("subset"), p.get("n"), p.get("residual_probe_auc")])
+        w.writerow([])
+        w.writerow(["bin", "t_lo", "t_hi", "n", "auc_resid_within_bin"])
+        for c in axis.get("conditional_auc_by_axis_bin", []):
+            w.writerow([c.get("bin"), c.get("t_lo"), c.get("t_hi"), c.get("n"),
+                        c.get("auc_resid_within_bin")])
+    print(f"wrote {ar_csv}")
+
+    lr_csv = csv_prefix + "_lowrank_gaussian.csv"
+    with open(lr_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["r", "oof_auc", "tnr_at_recall95"])
+        for b in lowrank.get("by_rank", []):
+            w.writerow([b.get("r"), b.get("oof_auc"), b.get("tnr_at_recall95")])
+        w.writerow([])
+        w.writerow(["subset", "n", "auc_best_r"])
+        for p in lowrank.get("per_class_auc_best_r", []):
+            w.writerow([p.get("subset"), p.get("n"), p.get("auc")])
+    print(f"wrote {lr_csv}")
+
+    _print_direction(direction)
+    _print_shared(shared)
+    _print_axis(axis)
+    _print_lowrank(lowrank)
+
+
+def _print_verdict(distribution, capture, probes, direction, shared, axis=None, lowrank=None):
     print("\n================ VERDICT ================")
     a = distribution["all"]
     m = a["metrics"]; c = a["counts"]
@@ -1354,6 +1700,8 @@ def _print_verdict(distribution, capture, probes, direction, shared):
 
     _print_direction(direction)
     _print_shared(shared)
+    _print_axis(axis) if axis is not None else None
+    _print_lowrank(lowrank) if lowrank is not None else None
     print("========================================\n")
 
 
